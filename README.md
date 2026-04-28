@@ -75,7 +75,7 @@ chmod +x ./install.sh
 ./install.sh
 ```
 
-The installer will prompt for your TV IP, MAC address, HDMI input, idle-monitor backend, idle timeout, and screen restore policy, then install the required services.
+The installer will prompt for your TV IP, MAC address, HDMI input, idle-monitor backend, idle timeout, and screen restore policy, then install the required services. System sleep/wake handling uses the default logind lifecycle service unless you opt out in `config.env`.
 
 On first use, you may need to accept a pairing prompt on the TV:
 
@@ -94,6 +94,7 @@ Advanced session restore behavior can be tuned in `config.env`:
 ```ini
 screen_idle_timeout=300
 screen_restore_policy=conservative
+system_sleep_wake_policy=enabled
 ```
 
 `screen_restore_policy=conservative` is the default. LG Buddy only restores when a matching LG Buddy marker says it previously blanked or powered off the TV.
@@ -102,10 +103,16 @@ Set `screen_restore_policy=aggressive` to let session wake/activity and system w
 
 `marker_only` is still accepted as a legacy alias for `conservative`.
 
+`system_sleep_wake_policy=enabled` is the default. Set
+`system_sleep_wake_policy=disabled` in `config.env` and rerun `./install.sh` if
+you do not want LG Buddy to control the TV around system sleep and wake.
+
 ## More Help
 
 - [User guide](docs/user-guide.md)
 - [Development](docs/development.md)
+- [Defaults and configuration](docs/defaults-and-configuration.md)
+- [Runtime event handler map](docs/runtime-event-handler-map.md)
 - [Gamepad subsystem](docs/gamepad-subsystem.md)
 - [Contributing](CONTRIBUTING.md)
 - [Release process](docs/release-process.md)

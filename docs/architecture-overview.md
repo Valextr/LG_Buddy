@@ -4,6 +4,9 @@ This document describes the current LG Buddy architecture.
 
 It is not a product roadmap. It is a map of what exists today and how the main pieces fit together.
 
+For the top-level system, desktop, and service event paths that enter the
+runtime, see [Runtime event handler map](runtime-event-handler-map.md).
+
 ## Repository Shape
 
 The repository now has one runtime implementation and one setup surface:
@@ -35,14 +38,14 @@ main.rs
            -> tv.rs
            -> wol.rs
            -> backend.rs
-           -> session.rs / session/inactivity.rs / session/gamepad/ / gnome.rs / swayidle.rs
+           -> session.rs / session/inactivity.rs / session/gamepad/ / gnome.rs / swayidle.rs / logind.rs
 ```
 
 ## System Diagram
 
-The current runtime can be visualized as one event path from the desktop
-session into the Rust monitor, and then one control path from policy code into
-the TV transport boundary.
+The current runtime can be visualized as desktop and system event paths into the
+Rust runtime, and then one control path from policy code into the TV transport
+boundary.
 
 ```mermaid
 flowchart LR
@@ -50,6 +53,10 @@ flowchart LR
         GNOME["GNOME session bus<br/>ScreenSaver / Mutter signals"]
         SWAY["swayidle<br/>idle hooks"]
         INPUT["Linux input devices<br/>gamepads / wheels / device events"]
+    end
+
+    subgraph SystemLifecycle["System Lifecycle"]
+        LOGIND["logind system bus<br/>PrepareForSleep"]
     end
 
     subgraph Rust["Rust Runtime"]
@@ -61,9 +68,10 @@ flowchart LR
         subgraph SessionSubsystem["Session Integration Subsystem"]
             BACKEND["backend.rs<br/>backend selection"]
             SESSIONMODEL["session.rs<br/>shared session model"]
-            RUNNER["session::runner<br/>monitor command"]
+            RUNNER["session::runner<br/>monitor + lifecycle commands"]
             GAMEPAD["session::gamepad<br/>gamepad activity source"]
-            BUS["session_bus.rs<br/>generic session-bus transport"]
+            BUS["session_bus.rs<br/>generic D-Bus transport"]
+            LOGINDADAPTER["logind.rs<br/>logind lifecycle mapping"]
 
             subgraph DEAdapters["Desktop Environment Adapters"]
                 GADAPTER["gnome.rs<br/>GNOME probe + signal mapping"]
@@ -92,6 +100,9 @@ flowchart LR
     GNOME --> BUS
     BUS --> GADAPTER
     GADAPTER -->|"SessionEvent"| SESSIONMODEL
+    LOGIND --> BUS
+    BUS --> LOGINDADAPTER
+    LOGINDADAPTER -->|"SessionEvent"| SESSIONMODEL
 
     SWAY -->|"timeout / resume hooks"| SADAPTER
     SADAPTER -->|"SessionEvent"| SESSIONMODEL
@@ -99,7 +110,7 @@ flowchart LR
     GAMEPAD -->|"UserActivity"| RUNNER
     SESSIONMODEL --> RUNNER
 
-    RUNNER -->|"Idle / Active /<br/>WakeRequested / UserActivity"| COMMANDS
+    RUNNER -->|"Idle / Active / WakeRequested /<br/>UserActivity / BeforeSleep / AfterResume"| COMMANDS
     COMMANDS --> CONFIG
     COMMANDS --> STATE
     COMMANDS --> TV
@@ -117,7 +128,7 @@ The intended split is:
   - shared error types
 - `commands.rs`
   - lifecycle policy
-  - startup, shutdown, screen-off, screen-on flows
+  - startup, shutdown, pre-sleep, screen-off, screen-on flows
   - orchestration of config, state, TV control, and Wake-on-LAN
 - `config.rs`
   - config path resolution
@@ -139,6 +150,8 @@ The intended split is:
 - `session.rs`
   - backend-neutral session event model
   - capability surface for desktop backends
+  - top-level event consumption is mapped separately in
+    [runtime-event-handler-map.md](runtime-event-handler-map.md)
 - `session/inactivity.rs`
   - synthesizes idle and active transitions from provider signals and configured thresholds
   - keeps blank and restore decisions edge-triggered instead of poll-triggered
@@ -152,12 +165,18 @@ The intended split is:
     may not appear through evdev
   - detailed in [gamepad-subsystem.md](gamepad-subsystem.md)
 - `session_bus.rs`
-  - generic blocking session-bus transport seam
-  - persistent D-Bus client for the GNOME monitor runtime
+  - generic blocking D-Bus transport seam
+  - session-bus use for the GNOME monitor runtime
+  - system-bus use for the logind lifecycle runtime
 - `session/runner.rs`
-  - backend-neutral monitor runner
+  - backend-neutral monitor and lifecycle runners
   - combines backend observations with the inactivity engine
   - dispatches semantic session events into the existing screen policy commands
+- `logind.rs`
+  - Linux system lifecycle adapter
+  - maps `org.freedesktop.login1` `PrepareForSleep` signals into canonical
+    lifecycle events
+  - acquires the logind sleep delay inhibitor used by the lifecycle service
 - `gnome.rs`
   - GNOME-specific capability probing and event mapping
   - capability probing plus ScreenSaver signal / IdleMonitor method mapping
@@ -180,6 +199,9 @@ The session-facing pieces should be read as one subsystem:
   - see [gamepad-subsystem.md](gamepad-subsystem.md) for adapter and lifecycle details
 - `session/runner.rs`
   - consumes normalized session events and idletime observations and dispatches runtime policy
+  - owns the `lifecycle` event loop for system sleep/wake handling
+- `logind.rs`
+  - adapts Linux system lifecycle signals into that shared session contract
 - `gnome.rs` and `swayidle.rs`
   - adapt backend-specific surfaces into that shared session contract
 
@@ -189,9 +211,13 @@ The binary currently supports these commands:
 
 - `startup [auto|boot|wake]`
 - `shutdown`
+- `sleep-pre`
+- `sleep`
+- `brightness`
 - `screen-off`
 - `screen-on`
 - `monitor`
+- `lifecycle`
 - `detect-backend`
 
 `lib.rs` parses the command line into a typed command enum and dispatches into
@@ -264,6 +290,25 @@ Flow:
 5. If the configured HDMI input is active, issue `power_off`.
 6. If input query fails, still attempt `power_off`.
 7. Power-off failures are logged but do not abort shutdown handling.
+
+### `lifecycle`
+
+`lifecycle` is the system sleep/wake event loop.
+
+Flow:
+
+1. Load config and exit successfully if `system_sleep_wake_policy=disabled`.
+2. Open the system bus.
+3. Subscribe to logind `PrepareForSleep` signals.
+4. Acquire a logind sleep delay inhibitor.
+5. On `PrepareForSleep(true)`:
+   - run pre-sleep policy through `SessionEvent::BeforeSleep`
+   - release the inhibitor so suspend can continue
+6. On `PrepareForSleep(false)`:
+   - run wake restore policy through `SessionEvent::AfterResume`
+   - reacquire the inhibitor for the next sleep cycle
+7. If config is changed to disable lifecycle handling while the service is
+   running, stop the lifecycle monitor cleanly.
 
 ### `detect-backend`
 
@@ -402,7 +447,8 @@ The session subsystem is intentionally asymmetric where the providers are asymme
 - delegated `swayidle` monitor execution is implemented for `timeout` and
   `resume` parity with the shell monitor
 - `swayidle` systemd-style hooks such as `before-sleep`, `after-resume`,
-  `lock`, and `unlock` are not wired into runtime behavior yet
+  `lock`, and `unlock` are not wired into monitor behavior; system lifecycle is
+  handled by the logind lifecycle service instead
 
 `swayidle` remains an external-tool backend by design. The current architecture does not aim to reimplement idle management tools that already solve the right problem.
 
@@ -456,7 +502,7 @@ The Rust runtime currently owns:
 - backend detection
 - startup
 - shutdown
-- system sleep hooks
+- system lifecycle monitor through logind
 - screen-off
 - screen-on
 - brightness control

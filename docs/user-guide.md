@@ -20,6 +20,7 @@ Available commands:
 - `screen-off`
 - `screen-on`
 - `monitor`
+- `lifecycle`
 - `detect-backend`
 
 Examples:
@@ -31,6 +32,10 @@ lg-buddy brightness
 ```
 
 In normal use, systemd starts the relevant commands automatically. Most users only need `brightness` or `configure.sh`.
+
+`lifecycle`, `sleep-pre`, and `startup wake` are normally service-owned system
+lifecycle commands. They are documented for troubleshooting, not day-to-day
+manual use.
 
 ## Desktop Idle Monitoring
 
@@ -87,6 +92,22 @@ Supported values are `auto`, `gnome`, and `swayidle`.
 
 For backend semantics and implementation details, see [session-backend-model.md](session-backend-model.md).
 
+## System Sleep And Wake
+
+Default installs enable system sleep/wake TV control through:
+
+```bash
+systemctl status LG_Buddy_lifecycle.service
+```
+
+The lifecycle service listens to logind `PrepareForSleep` events on the system
+bus. Before sleep, it runs LG Buddy's pre-sleep TV power-off policy. After
+resume, it runs wake restore policy.
+
+LG Buddy does not install the old sleep and wake systemd oneshot handlers or the
+old NetworkManager sleep hook. The installer and uninstaller remove those legacy
+artifacts from existing installs so there is only one system lifecycle owner.
+
 ## Configuration
 
 To change settings after installation:
@@ -109,6 +130,7 @@ Current config keys:
 - `screen_backend`
 - `screen_idle_timeout`
 - `screen_restore_policy`
+- `system_sleep_wake_policy`
 
 `screen_idle_timeout` is the inactivity threshold in seconds used by the session monitor.
 LG Buddy currently uses that timeout for both the GNOME and `swayidle` backends.
@@ -120,11 +142,21 @@ LG Buddy currently uses that timeout for both the GNOME and `swayidle` backends.
 
 `marker_only` is still accepted as a legacy alias for `conservative`.
 
+`system_sleep_wake_policy` controls automatic system sleep/wake TV handling:
+
+- `enabled`: default behavior, install and run the logind lifecycle service
+- `disabled`: do not install an active lifecycle owner
+
+The running lifecycle service rereads config and stops cleanly when this value
+is changed to `disabled`. To apply the installed service enable/remove state
+after changing the value, rerun `./install.sh`.
+
 Example:
 
 ```ini
 screen_idle_timeout=300
 screen_restore_policy=aggressive
+system_sleep_wake_policy=enabled
 ```
 
 Installed services receive the resolved config path through `LG_BUDDY_CONFIG`.

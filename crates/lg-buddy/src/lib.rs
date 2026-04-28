@@ -3,6 +3,7 @@ pub mod backend;
 pub mod commands;
 pub mod config;
 pub mod gnome;
+pub mod logind;
 pub mod session;
 pub mod session_bus;
 pub mod state;
@@ -19,7 +20,7 @@ use crate::commands::{
     run_brightness, run_screen_off, run_screen_on, run_shutdown, run_sleep, run_sleep_pre,
 };
 use crate::config::{ConfigError, ConfigPathError};
-use crate::session::runner::run_monitor;
+use crate::session::runner::{run_lifecycle_monitor, run_monitor};
 use crate::state::StateDirError;
 use std::fmt;
 use std::io::{self, Write};
@@ -34,6 +35,7 @@ pub enum Command {
     ScreenOff,
     ScreenOn,
     Monitor,
+    Lifecycle,
     DetectBackend,
 }
 
@@ -159,6 +161,7 @@ impl Command {
             Self::ScreenOff => "screen-off",
             Self::ScreenOn => "screen-on",
             Self::Monitor => "monitor",
+            Self::Lifecycle => "lifecycle",
             Self::DetectBackend => "detect-backend",
         }
     }
@@ -173,6 +176,7 @@ impl Command {
             Self::ScreenOff => "TODO: implemented via command handler",
             Self::ScreenOn => "TODO: implemented via command handler",
             Self::Monitor => "TODO: implemented via command handler",
+            Self::Lifecycle => "TODO: implemented via command handler",
             Self::DetectBackend => "TODO: implement detect-backend command",
         }
     }
@@ -196,6 +200,7 @@ Commands:
   screen-off      Blank the configured TV output if active
   screen-on       Restore the TV output after an LG Buddy screen-off
   monitor         Run the user-session monitor loop
+  lifecycle       Run the system lifecycle monitor loop
   detect-backend  Detect the active screen backend
 
 Startup modes:
@@ -249,6 +254,7 @@ where
         "screen-off" => Command::ScreenOff,
         "screen-on" => Command::ScreenOn,
         "monitor" => Command::Monitor,
+        "lifecycle" => Command::Lifecycle,
         "detect-backend" => Command::DetectBackend,
         other => return Err(ParseError::UnknownCommand(other.to_string())),
     };
@@ -275,6 +281,7 @@ pub fn run_command<W: Write>(command: Command, writer: &mut W) -> Result<(), Run
         Command::ScreenOff => run_screen_off(writer),
         Command::ScreenOn => run_screen_on(writer),
         Command::Monitor => run_monitor(writer),
+        Command::Lifecycle => run_lifecycle_monitor(writer),
     }
 }
 
@@ -345,6 +352,10 @@ mod tests {
             Ok(ParseOutcome::Command(Command::Monitor))
         );
         assert_eq!(
+            parse_args(["lifecycle"]),
+            Ok(ParseOutcome::Command(Command::Lifecycle))
+        );
+        assert_eq!(
             parse_args(["detect-backend"]),
             Ok(ParseOutcome::Command(Command::DetectBackend))
         );
@@ -390,6 +401,7 @@ mod tests {
             "screen-off",
             "screen-on",
             "monitor",
+            "lifecycle",
             "detect-backend",
         ] {
             assert!(

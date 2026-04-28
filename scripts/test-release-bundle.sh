@@ -116,9 +116,8 @@ assert_file "$BUNDLE_DIR/docs/user-guide.md"
 assert_file "$BUNDLE_DIR/docs/development.md"
 assert_file "$BUNDLE_DIR/docs/release-process.md"
 assert_file "$BUNDLE_DIR/systemd/LG_Buddy.service"
+assert_file "$BUNDLE_DIR/systemd/LG_Buddy_lifecycle.service"
 assert_file "$BUNDLE_DIR/systemd/LG_Buddy_screen.service"
-assert_file "$BUNDLE_DIR/systemd/LG_Buddy_sleep.service"
-assert_file "$BUNDLE_DIR/systemd/LG_Buddy_wake.service"
 
 HELP_OUTPUT="$("$BUNDLE_DIR/lg-buddy" 2>&1 || true)"
 printf '%s\n' "$HELP_OUTPUT" | grep -q "lg-buddy"
@@ -134,7 +133,7 @@ export LG_BUDDY_TV_MAC="aa:bb:cc:dd:ee:ff"
 export LG_BUDDY_INPUT="HDMI_2"
 export LG_BUDDY_SCREEN_BACKEND="auto"
 export LG_BUDDY_ENABLE_SCREEN_MONITOR="0"
-export LG_BUDDY_DISABLE_SLEEP_WAKE="0"
+export LG_BUDDY_SYSTEM_SLEEP_WAKE_POLICY="enabled"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
 export PIP_NO_PYTHON_VERSION_WARNING="1"
 
@@ -153,6 +152,9 @@ INSTALLED_VENV_PIP="$INSTALL_ROOT/usr/bin/LG_Buddy_PIP/bin/pip"
 INSTALLED_BSCPYLGTV="$INSTALL_ROOT/usr/bin/LG_Buddy_PIP/bin/bscpylgtvcommand"
 INSTALLED_POINTER="$INSTALL_ROOT/usr/lib/lg-buddy/config-path"
 SYSTEM_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy.service"
+LIFECYCLE_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_lifecycle.service"
+LEGACY_SLEEP_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_sleep.service"
+LEGACY_WAKE_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_wake.service"
 USER_SCREEN_SERVICE="$HOME/.config/systemd/user/LG_Buddy_screen.service"
 DESKTOP_ENTRY="$INSTALL_ROOT/usr/share/applications/LG_Buddy_Brightness.desktop"
 NM_SLEEP_HOOK="$INSTALL_ROOT/etc/NetworkManager/dispatcher.d/pre-down.d/LG_Buddy_sleep"
@@ -162,14 +164,27 @@ assert_executable "$INSTALLED_BINARY"
 assert_executable "$INSTALLED_VENV_PIP"
 assert_file "$INSTALLED_POINTER"
 assert_file "$SYSTEM_SERVICE"
+assert_file "$LIFECYCLE_SERVICE"
 assert_file "$USER_SCREEN_SERVICE"
 assert_file "$DESKTOP_ENTRY"
-assert_file "$NM_SLEEP_HOOK"
+[ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
+    echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
+    exit 1
+}
+[ ! -e "$LEGACY_WAKE_SERVICE" ] || {
+    echo "Legacy wake service installed unexpectedly: $LEGACY_WAKE_SERVICE"
+    exit 1
+}
+[ ! -e "$NM_SLEEP_HOOK" ] || {
+    echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
+    exit 1
+}
 
 grep -q '^tv_ip=192.168.1.10$' "$CONFIG_FILE"
 grep -q '^tv_mac=aa:bb:cc:dd:ee:ff$' "$CONFIG_FILE"
 grep -q '^input=HDMI_2$' "$CONFIG_FILE"
 grep -q '^screen_backend=auto$' "$CONFIG_FILE"
+grep -q '^system_sleep_wake_policy=enabled$' "$CONFIG_FILE"
 grep -q "$CONFIG_FILE" "$INSTALLED_POINTER"
 
 if [ "$SKIP_PIP_INSTALL" -eq 0 ]; then
@@ -201,6 +216,10 @@ export LG_BUDDY_REMOVE_CONFIG="1"
     echo "System service still present after uninstall: $SYSTEM_SERVICE"
     exit 1
 }
+[ ! -e "$LIFECYCLE_SERVICE" ] || {
+    echo "Lifecycle service still present after uninstall: $LIFECYCLE_SERVICE"
+    exit 1
+}
 [ ! -e "$USER_SCREEN_SERVICE" ] || {
     echo "User screen service still present after uninstall: $USER_SCREEN_SERVICE"
     exit 1
@@ -215,6 +234,53 @@ export LG_BUDDY_REMOVE_CONFIG="1"
 }
 [ ! -e "$CONFIG_FILE" ] || {
     echo "User config still present after uninstall: $CONFIG_FILE"
+    exit 1
+}
+
+export LG_BUDDY_SYSTEM_SLEEP_WAKE_POLICY="disabled"
+export LG_BUDDY_SKIP_PIP_INSTALL="1"
+(
+    cd "$BUNDLE_DIR"
+    ./install.sh
+)
+
+assert_file "$CONFIG_FILE"
+assert_executable "$INSTALLED_BINARY"
+assert_file "$SYSTEM_SERVICE"
+assert_file "$USER_SCREEN_SERVICE"
+[ ! -e "$LIFECYCLE_SERVICE" ] || {
+    echo "Lifecycle service installed despite disabled policy: $LIFECYCLE_SERVICE"
+    exit 1
+}
+[ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
+    echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
+    exit 1
+}
+[ ! -e "$LEGACY_WAKE_SERVICE" ] || {
+    echo "Legacy wake service installed unexpectedly: $LEGACY_WAKE_SERVICE"
+    exit 1
+}
+[ ! -e "$NM_SLEEP_HOOK" ] || {
+    echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
+    exit 1
+}
+grep -q '^system_sleep_wake_policy=disabled$' "$CONFIG_FILE"
+
+(
+    cd "$BUNDLE_DIR"
+    ./uninstall.sh
+)
+
+[ ! -e "$INSTALLED_BINARY" ] || {
+    echo "Installed binary still present after disabled-policy uninstall: $INSTALLED_BINARY"
+    exit 1
+}
+[ ! -e "$LIFECYCLE_SERVICE" ] || {
+    echo "Lifecycle service still present after disabled-policy uninstall: $LIFECYCLE_SERVICE"
+    exit 1
+}
+[ ! -e "$CONFIG_FILE" ] || {
+    echo "User config still present after disabled-policy uninstall: $CONFIG_FILE"
     exit 1
 }
 

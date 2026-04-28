@@ -1045,7 +1045,9 @@ mod tests {
         NetworkWaiter, Notifier, ReachabilityChecker, RebootDetector, SleepRequestDetector,
         Sleeper, StartupDeps, BRIGHTNESS_DEFAULT_VALUE,
     };
-    use crate::config::{Config, HdmiInput, MacAddress, ScreenBackend, ScreenRestorePolicy};
+    use crate::config::{
+        Config, HdmiInput, MacAddress, ScreenBackend, ScreenRestorePolicy, SystemSleepWakePolicy,
+    };
     use crate::state::ScreenOwnershipMarker;
     use crate::tv::BscpylgtvCommandClient;
     use crate::wol::{WakeOnLanError, WakeOnLanSender};
@@ -2177,6 +2179,7 @@ mod tests {
             screen_backend: ScreenBackend::Auto,
             screen_idle_timeout: 300,
             screen_restore_policy,
+            system_sleep_wake_policy: SystemSleepWakePolicy::Enabled,
         }
     }
 

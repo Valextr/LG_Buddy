@@ -57,6 +57,13 @@ validate_restore_policy() {
     esac
 }
 
+validate_system_sleep_wake_policy() {
+    case "$1" in
+        enabled|disabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_idle_timeout() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]
 }
@@ -75,6 +82,7 @@ current_input="HDMI_1"
 current_screen_backend="$LG_BUDDY_DEFAULT_SCREEN_BACKEND"
 current_screen_idle_timeout="$LG_BUDDY_DEFAULT_IDLE_TIMEOUT"
 current_screen_restore_policy="$LG_BUDDY_DEFAULT_SCREEN_RESTORE_POLICY"
+current_system_sleep_wake_policy="$LG_BUDDY_DEFAULT_SYSTEM_SLEEP_WAKE_POLICY"
 
 if lg_buddy_load_config >/dev/null 2>&1; then
     current_tv_ip="$tv_ip"
@@ -83,6 +91,7 @@ if lg_buddy_load_config >/dev/null 2>&1; then
     current_screen_backend="$screen_backend"
     current_screen_idle_timeout="$screen_idle_timeout"
     current_screen_restore_policy="$(normalize_restore_policy "$screen_restore_policy")"
+    current_system_sleep_wake_policy="$system_sleep_wake_policy"
     echo "Loaded existing configuration from $LG_BUDDY_CONFIG_FILE"
 fi
 
@@ -93,6 +102,13 @@ if [ "${LG_BUDDY_NONINTERACTIVE:-0}" = "1" ]; then
     screen_backend="${LG_BUDDY_SCREEN_BACKEND:-$current_screen_backend}"
     screen_idle_timeout="${LG_BUDDY_SCREEN_IDLE_TIMEOUT:-$current_screen_idle_timeout}"
     screen_restore_policy="${LG_BUDDY_SCREEN_RESTORE_POLICY:-$current_screen_restore_policy}"
+    system_sleep_wake_policy="${LG_BUDDY_SYSTEM_SLEEP_WAKE_POLICY:-$current_system_sleep_wake_policy}"
+    if [ -z "${LG_BUDDY_SYSTEM_SLEEP_WAKE_POLICY:-}" ] && [ -n "${LG_BUDDY_DISABLE_SLEEP_WAKE:-}" ]; then
+        case "$LG_BUDDY_DISABLE_SLEEP_WAKE" in
+            [Yy]*|1|true|TRUE|True|yes|YES|Yes) system_sleep_wake_policy="disabled" ;;
+            *) system_sleep_wake_policy="enabled" ;;
+        esac
+    fi
 
     validate_ip "$tv_ip" || {
         echo "LG_BUDDY_TV_IP must be set to a valid IPv4 address in non-interactive mode."
@@ -117,6 +133,10 @@ if [ "${LG_BUDDY_NONINTERACTIVE:-0}" = "1" ]; then
     screen_restore_policy="$(normalize_restore_policy "$screen_restore_policy")"
     validate_idle_timeout "$screen_idle_timeout" || {
         echo "LG_BUDDY_SCREEN_IDLE_TIMEOUT must be a positive integer."
+        exit 1
+    }
+    validate_system_sleep_wake_policy "$system_sleep_wake_policy" || {
+        echo "LG_BUDDY_SYSTEM_SLEEP_WAKE_POLICY must be one of enabled or disabled."
         exit 1
     }
 
@@ -256,6 +276,8 @@ else
             *) echo "  Please enter a number between 1 and 2." ;;
         esac
     done
+
+    system_sleep_wake_policy="$current_system_sleep_wake_policy"
 fi
 
 echo ""
@@ -266,6 +288,7 @@ echo "  PC Input:            $input"
 echo "  Screen Backend:      $screen_backend"
 echo "  Screen Idle Timeout: $screen_idle_timeout"
 echo "  Screen Restore:      $screen_restore_policy"
+echo "  System Sleep/Wake:   $system_sleep_wake_policy"
 echo "  Config File:         $CONFIG_FILE"
 echo ""
 
@@ -290,6 +313,7 @@ input=$input
 screen_backend=$screen_backend
 screen_idle_timeout=$screen_idle_timeout
 screen_restore_policy=$screen_restore_policy
+system_sleep_wake_policy=$system_sleep_wake_policy
 EOF
 
 chmod 600 "$CONFIG_FILE"

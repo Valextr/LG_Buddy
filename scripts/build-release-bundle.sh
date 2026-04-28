@@ -62,9 +62,8 @@ install -m 644 "$REPO_ROOT/LG_Buddy_Brightness.desktop" "$BUNDLE_DIR/LG_Buddy_Br
 install -m 644 "$REPO_ROOT/README.md" "$BUNDLE_DIR/README.md"
 install -m 644 "$REPO_ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 install -m 644 "$REPO_ROOT/systemd/LG_Buddy.service" "$BUNDLE_DIR/systemd/LG_Buddy.service"
+install -m 644 "$REPO_ROOT/systemd/LG_Buddy_lifecycle.service" "$BUNDLE_DIR/systemd/LG_Buddy_lifecycle.service"
 install -m 644 "$REPO_ROOT/systemd/LG_Buddy_screen.service" "$BUNDLE_DIR/systemd/LG_Buddy_screen.service"
-install -m 644 "$REPO_ROOT/systemd/LG_Buddy_sleep.service" "$BUNDLE_DIR/systemd/LG_Buddy_sleep.service"
-install -m 644 "$REPO_ROOT/systemd/LG_Buddy_wake.service" "$BUNDLE_DIR/systemd/LG_Buddy_wake.service"
 install -m 644 "$REPO_ROOT/systemd/lg_buddy.conf" "$BUNDLE_DIR/systemd/lg_buddy.conf"
 cp -R "$REPO_ROOT/docs/." "$BUNDLE_DIR/docs/"
 

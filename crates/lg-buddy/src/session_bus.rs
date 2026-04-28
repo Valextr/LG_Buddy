@@ -3,6 +3,7 @@ use dbus::blocking::{BlockingSender as DbusBlockingSender, Connection as DbusCon
 use dbus::message::{MatchRule as DbusMatchRule, MessageType as DbusMessageType};
 use dbus::Message as DbusMessage;
 use std::fmt;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 const SESSION_BUS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -49,6 +50,7 @@ impl std::error::Error for SessionBusError {}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BusValue {
     Bool(bool),
+    UnixFd(RawFd),
     U64(u64),
     String(String),
 }
@@ -57,6 +59,7 @@ impl BusValue {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Bool(_) => "bool",
+            Self::UnixFd(_) => "fd",
             Self::U64(_) => "u64",
             Self::String(_) => "string",
         }
@@ -96,6 +99,26 @@ impl BusReply {
             }),
             _ => Err(SessionBusError::UnexpectedReplyShape {
                 expected: "single u64",
+                actual: "multiple values",
+            }),
+        }
+    }
+
+    pub fn single_unix_fd(self) -> Result<OwnedFd, SessionBusError> {
+        match self.body.as_slice() {
+            [BusValue::UnixFd(fd)] => {
+                let fd = *fd;
+                // SAFETY: D-Bus transferred ownership of this descriptor into the
+                // reply. `BusValue` does not close raw descriptors on drop, so
+                // this creates the single owned handle responsible for closing it.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+            [value] => Err(SessionBusError::UnexpectedReplyShape {
+                expected: "single fd",
+                actual: value.kind(),
+            }),
+            _ => Err(SessionBusError::UnexpectedReplyShape {
+                expected: "single fd",
                 actual: "multiple values",
             }),
         }
@@ -388,6 +411,10 @@ pub fn new_session_bus_client() -> Result<Box<dyn SessionBusClient + Send>, Sess
     Ok(Box::new(DbusSessionBusClient::new_session()?))
 }
 
+pub fn new_system_bus_client() -> Result<Box<dyn SessionBusClient + Send>, SessionBusError> {
+    Ok(Box::new(DbusSessionBusClient::new_system()?))
+}
+
 pub struct DbusSessionBusClient {
     connection: DbusConnection,
     method_call_timeout: Duration,
@@ -398,6 +425,15 @@ impl DbusSessionBusClient {
     pub fn new_session() -> Result<Self, SessionBusError> {
         Ok(Self {
             connection: DbusConnection::new_session()
+                .map_err(|err| SessionBusError::Transport(err.to_string()))?,
+            method_call_timeout: DBUS_METHOD_CALL_TIMEOUT,
+            signal_rules: Vec::new(),
+        })
+    }
+
+    pub fn new_system() -> Result<Self, SessionBusError> {
+        Ok(Self {
+            connection: DbusConnection::new_system()
                 .map_err(|err| SessionBusError::Transport(err.to_string()))?,
             method_call_timeout: DBUS_METHOD_CALL_TIMEOUT,
             signal_rules: Vec::new(),
@@ -487,6 +523,12 @@ impl SessionBusClient for DbusSessionBusClient {
 fn append_dbus_message_value(message: DbusMessage, value: BusValue) -> DbusMessage {
     match value {
         BusValue::Bool(value) => message.append1(value),
+        BusValue::UnixFd(value) => {
+            // SAFETY: the descriptor is owned by the caller-provided BusValue for
+            // this message construction path.
+            let fd = unsafe { dbus::arg::OwnedFd::from_raw_fd(value) };
+            message.append1(fd)
+        }
         BusValue::U64(value) => message.append1(value),
         BusValue::String(value) => message.append1(value),
     }
@@ -495,10 +537,11 @@ fn append_dbus_message_value(message: DbusMessage, value: BusValue) -> DbusMessa
 fn bus_value_from_dbus_message_item(item: DbusMessageItem) -> Result<BusValue, SessionBusError> {
     match item {
         DbusMessageItem::Bool(value) => Ok(BusValue::Bool(value)),
+        DbusMessageItem::UnixFd(value) => Ok(BusValue::UnixFd(value.into_raw_fd())),
         DbusMessageItem::UInt64(value) => Ok(BusValue::U64(value)),
         DbusMessageItem::Str(value) => Ok(BusValue::String(value)),
         other => Err(SessionBusError::UnexpectedReplyShape {
-            expected: "bool/u64/string",
+            expected: "bool/u64/string/fd",
             actual: dbus_message_item_kind(&other),
         }),
     }
@@ -563,6 +606,7 @@ mod tests {
         DBUS_INTERFACE, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME,
     };
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::os::fd::AsRawFd;
     use std::time::Duration;
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -712,6 +756,10 @@ mod tests {
 
     #[test]
     fn reply_helpers_decode_expected_shapes() {
+        let mut pipe_fds = [0; 2];
+        let pipe_result = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        assert_eq!(pipe_result, 0, "test pipe should be created");
+
         assert_eq!(
             BusReply::new(vec![BusValue::Bool(true)]).single_bool(),
             Ok(true)
@@ -721,6 +769,10 @@ mod tests {
             BusReply::new(vec![BusValue::String("hello".to_string())]).single_string(),
             Ok("hello")
         );
+        let fd = BusReply::new(vec![BusValue::UnixFd(pipe_fds[0])])
+            .single_unix_fd()
+            .expect("decode fd");
+        assert_eq!(fd.as_raw_fd(), pipe_fds[0]);
         assert_eq!(
             BusReply::new(vec![BusValue::U64(7)]).single_bool(),
             Err(SessionBusError::UnexpectedReplyShape {
@@ -728,6 +780,11 @@ mod tests {
                 actual: "u64",
             })
         );
+
+        drop(fd);
+        unsafe {
+            libc::close(pipe_fds[1]);
+        }
     }
 
     #[test]

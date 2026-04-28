@@ -128,7 +128,8 @@ For the tagged GitHub release process, see [release-process.md](release-process.
 | `crates/lg-buddy/src/session/runner.rs` | Session monitor loop |
 | `crates/lg-buddy/src/session/inactivity.rs` | Session inactivity synthesis and thresholds |
 | `crates/lg-buddy/src/session/gamepad/` | Gamepad activity discovery, device-event refresh, adapters, capture, registry, and policy |
-| `crates/lg-buddy/src/session_bus.rs` | Generic session-bus transport seam |
+| `crates/lg-buddy/src/session_bus.rs` | Generic D-Bus transport used by session and system event sources |
+| `crates/lg-buddy/src/logind.rs` | Linux logind lifecycle signal and inhibitor adapter |
 | `crates/lg-buddy/src/gnome.rs` | GNOME backend integration |
 | `crates/lg-buddy/src/swayidle.rs` | `swayidle` backend integration |
 | `crates/lg-buddy/src/tv.rs` | TV transport boundary and facade |
@@ -142,8 +143,10 @@ For the tagged GitHub release process, see [release-process.md](release-process.
 | `.github/workflows/ci.yml` | CI validation workflow |
 | `.github/workflows/release.yml` | Tagged GitHub release workflow |
 | `bin/LG_Buddy_Common` | Shared shell config helper used by setup scripts |
-| `systemd/` | Installed unit files and tmpfiles config |
+| `systemd/` | Installed unit files and tmpfiles config, including the logind lifecycle service |
 | `docs/architecture-overview.md` | Runtime architecture |
+| `docs/defaults-and-configuration.md` | Product defaults and persistent configuration guidance |
 | `docs/gamepad-subsystem.md` | Gamepad activity architecture and adapter guidance |
+| `docs/runtime-event-handler-map.md` | Top-level system, desktop, and runtime event handler map |
 | `docs/session-backend-model.md` | Session backend semantics and capability model |
 | `docs/testing-strategy.md` | Test strategy and scope |

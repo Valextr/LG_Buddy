@@ -4,6 +4,10 @@ This document defines the current desktop session backend model.
 
 The goal is to unify providers semantically, not mechanically.
 
+For the broader map of systemd, lifecycle, desktop, and command-entrypoint
+events that consume these semantics, see
+[runtime-event-handler-map.md](runtime-event-handler-map.md).
+
 GNOME, `swayidle`, and future backends do not expose the same APIs or the same
 event richness. LG Buddy should not force them to look identical at the
 transport layer. Instead, the `session` module should define:

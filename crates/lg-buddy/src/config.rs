@@ -99,6 +99,37 @@ impl FromStr for ScreenRestorePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemSleepWakePolicy {
+    Enabled,
+    Disabled,
+}
+
+impl SystemSleepWakePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+impl FromStr for SystemSleepWakePolicy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HdmiInput {
     Hdmi1,
     Hdmi2,
@@ -196,6 +227,7 @@ pub struct Config {
     pub screen_backend: ScreenBackend,
     pub screen_idle_timeout: u64,
     pub screen_restore_policy: ScreenRestorePolicy,
+    pub system_sleep_wake_policy: SystemSleepWakePolicy,
 }
 
 #[derive(Debug)]
@@ -389,6 +421,11 @@ pub fn parse_config(contents: &str) -> Result<Config, ConfigError> {
         .and_then(|value| value.parse::<ScreenRestorePolicy>().ok())
         .unwrap_or(ScreenRestorePolicy::MarkerOnly);
 
+    let system_sleep_wake_policy = entries
+        .get("system_sleep_wake_policy")
+        .and_then(|value| value.parse::<SystemSleepWakePolicy>().ok())
+        .unwrap_or(SystemSleepWakePolicy::Enabled);
+
     Ok(Config {
         tv_ip,
         tv_mac,
@@ -396,6 +433,7 @@ pub fn parse_config(contents: &str) -> Result<Config, ConfigError> {
         screen_backend,
         screen_idle_timeout,
         screen_restore_policy,
+        system_sleep_wake_policy,
     })
 }
 
@@ -432,7 +470,7 @@ mod tests {
     use super::{
         parse_config, parse_home_from_passwd_entries, resolve_config_path, Config, ConfigError,
         ConfigPathError, ConfigPathSources, HdmiInput, ScreenBackend, ScreenRestorePolicy,
-        DEFAULT_IDLE_TIMEOUT,
+        SystemSleepWakePolicy, DEFAULT_IDLE_TIMEOUT,
     };
     use std::path::Path;
 
@@ -533,6 +571,7 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
             screen_backend=gnome
             screen_idle_timeout=450
             screen_restore_policy=aggressive
+            system_sleep_wake_policy=disabled
             ",
         )
         .expect("parse valid config");
@@ -545,6 +584,10 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
         assert_eq!(
             config.screen_restore_policy,
             ScreenRestorePolicy::Aggressive
+        );
+        assert_eq!(
+            config.system_sleep_wake_policy,
+            SystemSleepWakePolicy::Disabled
         );
     }
 
@@ -580,6 +623,7 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
                 screen_backend: ScreenBackend::Auto,
                 screen_idle_timeout: DEFAULT_IDLE_TIMEOUT,
                 screen_restore_policy: ScreenRestorePolicy::MarkerOnly,
+                system_sleep_wake_policy: SystemSleepWakePolicy::Enabled,
             }
         );
     }
@@ -594,6 +638,7 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
             screen_backend=gnome # use GNOME
             screen_idle_timeout=450 # seconds
             screen_restore_policy=aggressive # restore on wake without a marker
+            system_sleep_wake_policy=disabled # disable lifecycle TV control
             ",
         )
         .expect("parse sanitized config");
@@ -606,6 +651,10 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
         assert_eq!(
             config.screen_restore_policy,
             ScreenRestorePolicy::Aggressive
+        );
+        assert_eq!(
+            config.system_sleep_wake_policy,
+            SystemSleepWakePolicy::Disabled
         );
     }
 
@@ -637,6 +686,7 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
             screen_backend=not-a-backend
             screen_idle_timeout=not-a-number
             screen_restore_policy=not-a-policy
+            system_sleep_wake_policy=not-a-policy
             ",
         )
         .expect("parse config with malformed optional values");
@@ -647,6 +697,46 @@ vas:x:1000:1000:vas:/home/vas:/bin/bash\n";
             config.screen_restore_policy,
             ScreenRestorePolicy::MarkerOnly
         );
+        assert_eq!(
+            config.system_sleep_wake_policy,
+            SystemSleepWakePolicy::Enabled
+        );
+    }
+
+    #[test]
+    fn parse_accepts_system_sleep_wake_policy_values() {
+        let enabled = parse_config(
+            "\
+            tv_ip=192.168.1.42
+            tv_mac=aa:bb:cc:dd:ee:ff
+            input=HDMI_1
+            system_sleep_wake_policy=enabled
+            ",
+        )
+        .expect("parse enabled lifecycle policy");
+
+        let disabled = parse_config(
+            "\
+            tv_ip=192.168.1.42
+            tv_mac=aa:bb:cc:dd:ee:ff
+            input=HDMI_1
+            system_sleep_wake_policy=disabled
+            ",
+        )
+        .expect("parse disabled lifecycle policy");
+
+        assert_eq!(
+            enabled.system_sleep_wake_policy,
+            SystemSleepWakePolicy::Enabled
+        );
+        assert!(enabled.system_sleep_wake_policy.is_enabled());
+        assert_eq!(
+            disabled.system_sleep_wake_policy,
+            SystemSleepWakePolicy::Disabled
+        );
+        assert!(!disabled.system_sleep_wake_policy.is_enabled());
+        assert_eq!(SystemSleepWakePolicy::Enabled.as_str(), "enabled");
+        assert_eq!(SystemSleepWakePolicy::Disabled.as_str(), "disabled");
     }
 
     #[test]

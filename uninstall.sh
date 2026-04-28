@@ -35,9 +35,11 @@ CONFIG_POINTER_PATH="${SYSTEM_LIB_DIR}/config-path"
 SYSTEM_SLEEP_HOOK_PATH="$(prefix_path "/usr/lib/systemd/system-sleep/LG_Buddy_sleep_hook")"
 SYSTEMD_SYSTEM_DIR="$(prefix_path "/etc/systemd/system")"
 SYSTEMD_SERVICE_PATH="${SYSTEMD_SYSTEM_DIR}/LG_Buddy.service"
+SYSTEMD_LIFECYCLE_SERVICE_PATH="${SYSTEMD_SYSTEM_DIR}/LG_Buddy_lifecycle.service"
 SYSTEMD_WAKE_SERVICE_PATH="${SYSTEMD_SYSTEM_DIR}/LG_Buddy_wake.service"
 SYSTEMD_SLEEP_SERVICE_PATH="${SYSTEMD_SYSTEM_DIR}/LG_Buddy_sleep.service"
 SYSTEMD_SERVICE_OVERRIDE_DIR="${SYSTEMD_SYSTEM_DIR}/LG_Buddy.service.d"
+SYSTEMD_LIFECYCLE_OVERRIDE_DIR="${SYSTEMD_SYSTEM_DIR}/LG_Buddy_lifecycle.service.d"
 SYSTEMD_WAKE_OVERRIDE_DIR="${SYSTEMD_SYSTEM_DIR}/LG_Buddy_wake.service.d"
 SYSTEMD_SLEEP_OVERRIDE_DIR="${SYSTEMD_SYSTEM_DIR}/LG_Buddy_sleep.service.d"
 TMPFILES_CONF_PATH="$(prefix_path "/etc/tmpfiles.d/lg_buddy.conf")"
@@ -71,21 +73,26 @@ if [ "$SKIP_SYSTEMD_ACTIONS" = "1" ]; then
     echo "Skipping systemd disable/stop actions because LG_BUDDY_SKIP_SYSTEMD_ACTIONS=1."
 else
     run_privileged systemctl disable LG_Buddy.service 2>/dev/null || true
+    run_privileged systemctl disable LG_Buddy_lifecycle.service 2>/dev/null || true
     run_privileged systemctl disable LG_Buddy_wake.service 2>/dev/null || true
     run_privileged systemctl disable LG_Buddy_sleep.service 2>/dev/null || true
     systemctl --user disable LG_Buddy_screen.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy.service 2>/dev/null || true
+    run_privileged systemctl stop LG_Buddy_lifecycle.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy_wake.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy_sleep.service 2>/dev/null || true
     systemctl --user stop LG_Buddy_screen.service 2>/dev/null || true
 fi
 run_privileged rm -f "$SYSTEMD_SERVICE_PATH"
+run_privileged rm -f "$SYSTEMD_LIFECYCLE_SERVICE_PATH"
 run_privileged rm -f "$SYSTEMD_WAKE_SERVICE_PATH"
 run_privileged rm -f "$SYSTEMD_SLEEP_SERVICE_PATH"
 run_privileged rm -f "${SYSTEMD_SERVICE_OVERRIDE_DIR}/config.conf"
+run_privileged rm -f "${SYSTEMD_LIFECYCLE_OVERRIDE_DIR}/config.conf"
 run_privileged rm -f "${SYSTEMD_WAKE_OVERRIDE_DIR}/config.conf"
 run_privileged rm -f "${SYSTEMD_SLEEP_OVERRIDE_DIR}/config.conf"
 run_privileged rmdir "$SYSTEMD_SERVICE_OVERRIDE_DIR" 2>/dev/null || true
+run_privileged rmdir "$SYSTEMD_LIFECYCLE_OVERRIDE_DIR" 2>/dev/null || true
 run_privileged rmdir "$SYSTEMD_WAKE_OVERRIDE_DIR" 2>/dev/null || true
 run_privileged rmdir "$SYSTEMD_SLEEP_OVERRIDE_DIR" 2>/dev/null || true
 rm -f "$USER_SCREEN_SERVICE_PATH"
