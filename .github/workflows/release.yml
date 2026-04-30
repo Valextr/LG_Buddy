@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "release-*"
+      - "v*"
 
 permissions:
   contents: write
@@ -61,7 +61,7 @@ jobs:
 
       - name: Create release bundle
         run: |
-          version="${GITHUB_REF_NAME#release-}"
+          version="${GITHUB_REF_NAME#v}"
           ./scripts/build-release-bundle.sh \
             --target x86_64-unknown-linux-musl \
             --version "$version" \
@@ -69,7 +69,7 @@ jobs:
 
       - name: Smoke test release bundle
         run: |
-          version="${GITHUB_REF_NAME#release-}"
+          version="${GITHUB_REF_NAME#v}"
           ./scripts/test-release-bundle.sh \
             --skip-pip-install \
             --archive "dist/lg-buddy-${version}-x86_64-unknown-linux-musl.tar.gz"

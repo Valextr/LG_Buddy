@@ -114,7 +114,7 @@ The smoke test unpacks the archive, verifies expected files are present, runs a 
 Dry-run the GitHub release publish step with:
 
 ```bash
-GH_RELEASE_DRY_RUN=1 ./scripts/publish-release-assets.sh --dist-dir ./dist --tag release-0.0.0-dev
+GH_RELEASE_DRY_RUN=1 ./scripts/publish-release-assets.sh --dist-dir ./dist --tag v0.0.0-dev
 ```
 
 For the tagged GitHub release process, see [release-process.md](release-process.md).

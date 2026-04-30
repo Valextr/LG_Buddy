@@ -49,20 +49,28 @@ CHECKSUM_FILE="$DIST_DIR/sha256sums.txt"
     exit 1
 }
 
-VERSION="${TAG#release-}"
+VERSION="${TAG#v}"
 TITLE="LG Buddy ${VERSION}"
 NOTES="Prebuilt LG Buddy release bundle for Linux. Extract the archive and run ./install.sh from inside the bundle."
+RELEASE_FLAGS=()
+
+if [[ "$VERSION" == *-* ]]; then
+    RELEASE_FLAGS+=(--prerelease)
+fi
 
 if [ "$DRY_RUN" = "1" ]; then
     echo "Dry run: would publish tag $TAG"
     printf 'Archive: %s\n' "${ARCHIVES[@]}"
     echo "Checksum file: $CHECKSUM_FILE"
     echo "Title: $TITLE"
+    if [ "${#RELEASE_FLAGS[@]}" -gt 0 ]; then
+        echo "Release flags: ${RELEASE_FLAGS[*]}"
+    fi
     exit 0
 fi
 
 if gh release view "$TAG" >/dev/null 2>&1; then
     gh release upload "$TAG" "${ARCHIVES[@]}" "$CHECKSUM_FILE" --clobber
 else
-    gh release create "$TAG" "${ARCHIVES[@]}" "$CHECKSUM_FILE" --title "$TITLE" --notes "$NOTES"
+    gh release create "$TAG" "${ARCHIVES[@]}" "$CHECKSUM_FILE" --title "$TITLE" --notes "$NOTES" "${RELEASE_FLAGS[@]}"
 fi

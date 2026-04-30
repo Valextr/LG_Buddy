@@ -82,4 +82,4 @@ jobs:
       - name: Dry-run publish release assets
         env:
           GH_RELEASE_DRY_RUN: "1"
-        run: ./scripts/publish-release-assets.sh --dist-dir dist --tag release-ci-smoke
+        run: ./scripts/publish-release-assets.sh --dist-dir dist --tag v0.0.0-ci-smoke

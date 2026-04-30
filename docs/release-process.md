@@ -1,6 +1,6 @@
 # Release Process
 
-LG Buddy release automation is triggered by pushing a Git tag that matches `release-*`.
+LG Buddy release automation is triggered by pushing a Git tag that matches `v*`.
 
 ## What the release workflow does
 
@@ -29,12 +29,12 @@ LG Buddy release automation is triggered by pushing a Git tag that matches `rele
 ## Creating a release
 
 1. Make sure the branch you want to release has passed CI.
-2. Create a tag such as `release-0.7.0`.
+2. Create a tag such as `v0.7.0`.
 3. Push the tag.
 
 ```bash
-git tag release-0.7.0
-git push origin release-0.7.0
+git tag v0.7.0
+git push origin v0.7.0
 ```
 
 ## Installing from a release bundle
