@@ -457,6 +457,11 @@ The ownership markers answer one question:
 
 It does not answer whether restore should always be blocked.
 In `aggressive` mode, restore may proceed even when the marker is absent.
+When the system-scope marker exists after a sleep pre-action, session screen
+actions defer to the lifecycle resume path while `system_sleep_wake_policy` is
+enabled. The lifecycle path keeps that marker present while it waits for network
+readiness and attempts input restore, then clears it after success or exhausted
+restore attempts.
 
 There are two scopes:
 

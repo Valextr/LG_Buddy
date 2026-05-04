@@ -25,6 +25,8 @@ use crate::RunError;
 
 const SCREEN_ON_INITIAL_WAKE_DELAY: Duration = Duration::from_secs(6);
 const SCREEN_ON_WAKE_ATTEMPTS: u32 = 6;
+const MACHINE_SLEEP_PENDING_DETAIL: &str = "machine sleep is pending";
+const SYSTEM_RESTORE_PENDING_DETAIL: &str = "system resume restore is pending";
 
 pub(crate) trait Sleeper {
     fn sleep(&self, duration: Duration);
@@ -38,11 +40,44 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
-pub(crate) struct ScreenOnDeps<'a, C, S, Sl, P> {
+pub(crate) trait SystemLifecycleStatusProvider {
+    fn system_restore_pending(&self) -> bool;
+}
+
+pub(crate) struct SystemMarkerLifecycleStatusProvider {
+    marker: ScreenOwnershipMarker,
+}
+
+impl SystemMarkerLifecycleStatusProvider {
+    fn from_env() -> Result<Self, crate::state::StateDirError> {
+        Ok(Self {
+            marker: ScreenOwnershipMarker::from_env(StateScope::System)?,
+        })
+    }
+}
+
+impl SystemLifecycleStatusProvider for SystemMarkerLifecycleStatusProvider {
+    fn system_restore_pending(&self) -> bool {
+        self.marker.exists()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct NoopSystemLifecycleStatusProvider;
+
+#[cfg(test)]
+impl SystemLifecycleStatusProvider for NoopSystemLifecycleStatusProvider {
+    fn system_restore_pending(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) struct ScreenOnDeps<'a, C, S, Sl, P, L> {
     pub(crate) tv_client: &'a C,
     pub(crate) wol_sender: &'a S,
     pub(crate) sleeper: &'a Sl,
     pub(crate) phase_provider: &'a mut P,
+    pub(crate) lifecycle_status: &'a L,
 }
 
 struct ScreenOnWakeDeps<'a, C, S, Sl> {
@@ -75,7 +110,13 @@ impl<N> ScreenPolicyDecision<N> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenEligibilityNext {
     Continue,
-    Stop,
+    Stop(ScreenActionBlockReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenActionBlockReason {
+    MachineSleepPending,
+    SystemRestorePending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +124,7 @@ struct ScreenActionEligibilityInput {
     source: EventSource,
     lifecycle_policy_enabled: bool,
     runtime_phase: RuntimePhaseRead,
+    system_restore_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +183,8 @@ pub(crate) fn run_screen_off_from_env_for_event<W: Write>(
         ScreenOwnershipMarker::from_env(StateScope::Session).map_err(RunError::StateDir)?;
     let tv_client = build_tv_client(&config_path)?;
     let mut phase_provider = LogindRuntimePhaseProvider::from_system_bus();
+    let lifecycle_status =
+        SystemMarkerLifecycleStatusProvider::from_env().map_err(RunError::StateDir)?;
 
     run_screen_off_with_event(
         writer,
@@ -149,6 +193,7 @@ pub(crate) fn run_screen_off_from_env_for_event<W: Write>(
         &tv_client,
         event,
         &mut phase_provider,
+        &lifecycle_status,
     )
 }
 
@@ -174,6 +219,8 @@ pub(crate) fn run_screen_on_from_env_for_event<W: Write>(
     let wol_sender = UdpWakeOnLanSender::default();
     let sleeper = ThreadSleeper;
     let mut phase_provider = LogindRuntimePhaseProvider::from_system_bus();
+    let lifecycle_status =
+        SystemMarkerLifecycleStatusProvider::from_env().map_err(RunError::StateDir)?;
 
     run_screen_on_with_event(
         writer,
@@ -184,6 +231,7 @@ pub(crate) fn run_screen_on_from_env_for_event<W: Write>(
             wol_sender: &wol_sender,
             sleeper: &sleeper,
             phase_provider: &mut phase_provider,
+            lifecycle_status: &lifecycle_status,
         },
         event,
     )
@@ -197,6 +245,7 @@ pub(crate) fn run_screen_off_with<W: Write>(
     tv_client: &impl TvClient,
 ) -> Result<(), RunError> {
     let mut phase_provider = NoopRuntimePhaseProvider;
+    let lifecycle_status = NoopSystemLifecycleStatusProvider;
     run_screen_off_with_event(
         writer,
         config,
@@ -204,19 +253,34 @@ pub(crate) fn run_screen_off_with<W: Write>(
         tv_client,
         RuntimeEvent::new(EventSource::CliApi, RuntimeEventKind::ScreenBlankRequested),
         &mut phase_provider,
+        &lifecycle_status,
     )
 }
 
-pub(crate) fn run_screen_off_with_event<W: Write, C: TvClient, P: RuntimePhaseProvider>(
+pub(crate) fn run_screen_off_with_event<
+    W: Write,
+    C: TvClient,
+    P: RuntimePhaseProvider,
+    L: SystemLifecycleStatusProvider,
+>(
     writer: &mut W,
     config: &Config,
     marker: &ScreenOwnershipMarker,
     tv_client: &C,
     event: RuntimeEvent,
     phase_provider: &mut P,
+    lifecycle_status: &L,
 ) -> Result<(), RunError> {
-    run_screen_off_with_outcome_for_event(writer, config, marker, tv_client, event, phase_provider)
-        .map(|_| ())
+    run_screen_off_with_outcome_for_event(
+        writer,
+        config,
+        marker,
+        tv_client,
+        event,
+        phase_provider,
+        lifecycle_status,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -227,6 +291,7 @@ pub(crate) fn run_screen_off_with_outcome<W: Write, C: TvClient>(
     tv_client: &C,
 ) -> Result<PolicyOutcome, RunError> {
     let mut phase_provider = NoopRuntimePhaseProvider;
+    let lifecycle_status = NoopSystemLifecycleStatusProvider;
     run_screen_off_with_outcome_for_event(
         writer,
         config,
@@ -234,6 +299,7 @@ pub(crate) fn run_screen_off_with_outcome<W: Write, C: TvClient>(
         tv_client,
         RuntimeEvent::new(EventSource::CliApi, RuntimeEventKind::ScreenBlankRequested),
         &mut phase_provider,
+        &lifecycle_status,
     )
 }
 
@@ -241,6 +307,7 @@ pub(crate) fn run_screen_off_with_outcome_for_event<
     W: Write,
     C: TvClient,
     P: RuntimePhaseProvider,
+    L: SystemLifecycleStatusProvider,
 >(
     writer: &mut W,
     config: &Config,
@@ -248,6 +315,7 @@ pub(crate) fn run_screen_off_with_outcome_for_event<
     tv_client: &C,
     event: RuntimeEvent,
     phase_provider: &mut P,
+    lifecycle_status: &L,
 ) -> Result<PolicyOutcome, RunError> {
     let mut outcome = PolicyOutcome::new();
     if !apply_screen_action_eligibility(
@@ -256,6 +324,7 @@ pub(crate) fn run_screen_off_with_outcome_for_event<
         config,
         event,
         phase_provider,
+        lifecycle_status,
         &mut outcome,
     )? {
         return Ok(outcome);
@@ -314,6 +383,7 @@ pub(crate) fn run_screen_on_with<W: Write, C: TvClient, S: WakeOnLanSender, Sl: 
     sleeper: &Sl,
 ) -> Result<(), RunError> {
     let mut phase_provider = NoopRuntimePhaseProvider;
+    let lifecycle_status = NoopSystemLifecycleStatusProvider;
     run_screen_on_with_event(
         writer,
         config,
@@ -323,6 +393,7 @@ pub(crate) fn run_screen_on_with<W: Write, C: TvClient, S: WakeOnLanSender, Sl: 
             wol_sender,
             sleeper,
             phase_provider: &mut phase_provider,
+            lifecycle_status: &lifecycle_status,
         },
         RuntimeEvent::new(
             EventSource::CliApi,
@@ -337,11 +408,12 @@ pub(crate) fn run_screen_on_with_event<
     S: WakeOnLanSender,
     Sl: Sleeper,
     P: RuntimePhaseProvider,
+    L: SystemLifecycleStatusProvider,
 >(
     writer: &mut W,
     config: &Config,
     marker: &ScreenOwnershipMarker,
-    deps: ScreenOnDeps<'_, C, S, Sl, P>,
+    deps: ScreenOnDeps<'_, C, S, Sl, P, L>,
     event: RuntimeEvent,
 ) -> Result<(), RunError> {
     run_screen_on_with_outcome_for_event(writer, config, marker, deps, event).map(|_| ())
@@ -357,6 +429,7 @@ pub(crate) fn run_screen_on_with_outcome<W: Write, C: TvClient, S: WakeOnLanSend
     sleeper: &Sl,
 ) -> Result<PolicyOutcome, RunError> {
     let mut phase_provider = NoopRuntimePhaseProvider;
+    let lifecycle_status = NoopSystemLifecycleStatusProvider;
     run_screen_on_with_outcome_for_event(
         writer,
         config,
@@ -366,6 +439,7 @@ pub(crate) fn run_screen_on_with_outcome<W: Write, C: TvClient, S: WakeOnLanSend
             wol_sender,
             sleeper,
             phase_provider: &mut phase_provider,
+            lifecycle_status: &lifecycle_status,
         },
         RuntimeEvent::new(
             EventSource::CliApi,
@@ -380,11 +454,12 @@ pub(crate) fn run_screen_on_with_outcome_for_event<
     S: WakeOnLanSender,
     Sl: Sleeper,
     P: RuntimePhaseProvider,
+    L: SystemLifecycleStatusProvider,
 >(
     writer: &mut W,
     config: &Config,
     marker: &ScreenOwnershipMarker,
-    deps: ScreenOnDeps<'_, C, S, Sl, P>,
+    deps: ScreenOnDeps<'_, C, S, Sl, P, L>,
     event: RuntimeEvent,
 ) -> Result<PolicyOutcome, RunError> {
     let mut outcome = PolicyOutcome::new();
@@ -394,6 +469,7 @@ pub(crate) fn run_screen_on_with_outcome_for_event<
         config,
         event,
         deps.phase_provider,
+        deps.lifecycle_status,
         &mut outcome,
     )? {
         return Ok(outcome);
@@ -439,19 +515,44 @@ fn decide_screen_action_eligibility(
 
     match input.runtime_phase {
         RuntimePhaseRead::Pending => ScreenPolicyDecision::with_outcome(
-            ScreenEligibilityNext::Stop,
+            ScreenEligibilityNext::Stop(ScreenActionBlockReason::MachineSleepPending),
             PolicyOutcome::new().with_no_action(DecisionReason::with_detail(
                 DecisionReasonCode::RuntimePhaseIneligible,
-                "machine sleep is pending",
+                MACHINE_SLEEP_PENDING_DETAIL,
             )),
         ),
-        RuntimePhaseRead::NotPending => ScreenPolicyDecision::new(ScreenEligibilityNext::Continue),
-        RuntimePhaseRead::Unknown { detail } => ScreenPolicyDecision::with_outcome(
-            ScreenEligibilityNext::Continue,
-            PolicyOutcome::new().with_diagnostic(Diagnostic::warning(format!(
-                "runtime phase read failed; failing open: {detail}"
-            ))),
-        ),
+        RuntimePhaseRead::NotPending => {
+            if input.system_restore_pending {
+                ScreenPolicyDecision::with_outcome(
+                    ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending),
+                    PolicyOutcome::new().with_no_action(DecisionReason::with_detail(
+                        DecisionReasonCode::RuntimePhaseIneligible,
+                        SYSTEM_RESTORE_PENDING_DETAIL,
+                    )),
+                )
+            } else {
+                ScreenPolicyDecision::new(ScreenEligibilityNext::Continue)
+            }
+        }
+        RuntimePhaseRead::Unknown { detail } => {
+            if input.system_restore_pending {
+                let outcome = PolicyOutcome::new().with_diagnostic(Diagnostic::warning(format!(
+                    "runtime phase read failed; system resume restore is pending, failing closed: {detail}"
+                )));
+                ScreenPolicyDecision::with_outcome(
+                    ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending),
+                    outcome.with_no_action(DecisionReason::with_detail(
+                        DecisionReasonCode::RuntimePhaseIneligible,
+                        SYSTEM_RESTORE_PENDING_DETAIL,
+                    )),
+                )
+            } else {
+                let outcome = PolicyOutcome::new().with_diagnostic(Diagnostic::warning(format!(
+                    "runtime phase read failed; failing open: {detail}"
+                )));
+                ScreenPolicyDecision::with_outcome(ScreenEligibilityNext::Continue, outcome)
+            }
+        }
     }
 }
 
@@ -615,34 +716,51 @@ fn decide_screen_on_wake_exhausted(marker_exists: bool) -> PolicyOutcome {
     }
 }
 
-fn apply_screen_action_eligibility<W: Write, P: RuntimePhaseProvider>(
+fn apply_screen_action_eligibility<
+    W: Write,
+    P: RuntimePhaseProvider,
+    L: SystemLifecycleStatusProvider,
+>(
     writer: &mut W,
     prefix: &str,
     config: &Config,
     event: RuntimeEvent,
     phase_provider: &mut P,
+    lifecycle_status: &L,
     outcome: &mut PolicyOutcome,
 ) -> Result<bool, RunError> {
     let lifecycle_policy_enabled = config.system_sleep_wake_policy.is_enabled();
-    let runtime_phase = if is_session_screen_source(event.source) && lifecycle_policy_enabled {
+    let session_lifecycle_action =
+        is_session_screen_source(event.source) && lifecycle_policy_enabled;
+    let runtime_phase = if session_lifecycle_action {
         phase_provider.machine_sleep_pending()
     } else {
         RuntimePhaseRead::NotPending
     };
+    let system_restore_pending =
+        session_lifecycle_action && lifecycle_status.system_restore_pending();
     let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
         source: event.source,
         lifecycle_policy_enabled,
         runtime_phase,
+        system_restore_pending,
     });
 
-    if decision.next == ScreenEligibilityNext::Stop {
-        writeln!(
+    match decision.next {
+        ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending) => {
+            writeln!(
+                writer,
+                "{prefix}: System resume restore is pending; lifecycle owns TV actions. Skipping session screen action."
+            )?
+        }
+        ScreenEligibilityNext::Stop(ScreenActionBlockReason::MachineSleepPending) => writeln!(
             writer,
             "{prefix}: Machine sleep is pending; lifecycle owns TV actions. Skipping session screen action."
-        )?;
+        )?,
+        ScreenEligibilityNext::Continue => {}
     }
 
-    let should_continue = decision.next == ScreenEligibilityNext::Continue;
+    let should_continue = matches!(decision.next, ScreenEligibilityNext::Continue);
     outcome.merge(decision.outcome);
     Ok(should_continue)
 }
@@ -1008,8 +1126,9 @@ mod tests {
         decide_screen_action_eligibility, decide_screen_off_after_input, decide_screen_on_start,
         run_screen_off_with_outcome, run_screen_off_with_outcome_for_event,
         run_screen_on_with_outcome, run_screen_on_with_outcome_for_event,
-        ScreenActionEligibilityInput, ScreenEligibilityNext, ScreenOffInputObservation,
-        ScreenOffNext, ScreenOnDeps, ScreenOnNext, Sleeper,
+        NoopSystemLifecycleStatusProvider, ScreenActionBlockReason, ScreenActionEligibilityInput,
+        ScreenEligibilityNext, ScreenOffInputObservation, ScreenOffNext, ScreenOnDeps,
+        ScreenOnNext, Sleeper, SystemLifecycleStatusProvider,
     };
     use crate::config::{
         Config, HdmiInput, MacAddress, ScreenBackend, ScreenRestorePolicy, SystemSleepWakePolicy,
@@ -1038,9 +1157,13 @@ mod tests {
             source: EventSource::DesktopSession,
             lifecycle_policy_enabled: true,
             runtime_phase: RuntimePhaseRead::Pending,
+            system_restore_pending: false,
         });
 
-        assert_eq!(decision.next, ScreenEligibilityNext::Stop);
+        assert_eq!(
+            decision.next,
+            ScreenEligibilityNext::Stop(ScreenActionBlockReason::MachineSleepPending)
+        );
         assert!(decision.outcome.actions.is_empty());
         assert!(decision.outcome.state_transitions.is_empty());
         assert_eq!(decision.outcome.no_actions.len(), 1);
@@ -1058,12 +1181,61 @@ mod tests {
             runtime_phase: RuntimePhaseRead::Unknown {
                 detail: "system bus unavailable".to_string(),
             },
+            system_restore_pending: false,
         });
 
         assert_eq!(decision.next, ScreenEligibilityNext::Continue);
         assert!(decision.outcome.actions.is_empty());
         assert!(decision.outcome.no_actions.is_empty());
         assert_eq!(decision.outcome.diagnostics.len(), 1);
+        assert!(decision.outcome.diagnostics[0]
+            .message
+            .contains("failing open"));
+    }
+
+    #[test]
+    fn pure_policy_fails_closed_when_runtime_phase_is_unknown_but_system_restore_is_pending() {
+        let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
+            source: EventSource::DesktopSession,
+            lifecycle_policy_enabled: true,
+            runtime_phase: RuntimePhaseRead::Unknown {
+                detail: "system bus unavailable".to_string(),
+            },
+            system_restore_pending: true,
+        });
+
+        assert_eq!(
+            decision.next,
+            ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending)
+        );
+        assert!(decision.outcome.actions.is_empty());
+        assert_eq!(decision.outcome.no_actions.len(), 1);
+        assert_eq!(decision.outcome.diagnostics.len(), 1);
+        assert!(decision.outcome.diagnostics[0]
+            .message
+            .contains("failing closed"));
+    }
+
+    #[test]
+    fn pure_policy_marks_session_action_ineligible_while_system_restore_is_pending() {
+        let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
+            source: EventSource::DesktopSession,
+            lifecycle_policy_enabled: true,
+            runtime_phase: RuntimePhaseRead::NotPending,
+            system_restore_pending: true,
+        });
+
+        assert_eq!(
+            decision.next,
+            ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending)
+        );
+        assert!(decision.outcome.actions.is_empty());
+        assert!(decision.outcome.state_transitions.is_empty());
+        assert_eq!(decision.outcome.no_actions.len(), 1);
+        assert_eq!(
+            decision.outcome.no_actions[0].reason.code,
+            DecisionReasonCode::RuntimePhaseIneligible
+        );
     }
 
     #[test]
@@ -1265,6 +1437,7 @@ mod tests {
         mock.set_input("HDMI_2");
         let client = client_for_mock(&mock);
         let mut phase = FixedRuntimePhaseProvider::pending();
+        let lifecycle_status = NoopSystemLifecycleStatusProvider;
 
         let mut output = Vec::new();
         let outcome = run_screen_off_with_outcome_for_event(
@@ -1274,6 +1447,7 @@ mod tests {
             &client,
             RuntimeEvent::new(EventSource::DesktopSession, RuntimeEventKind::SessionIdle),
             &mut phase,
+            &lifecycle_status,
         )
         .expect("pending machine sleep should skip session screen off");
 
@@ -1300,6 +1474,7 @@ mod tests {
         let wol = RecordingWakeOnLanSender::default();
         let sleeper = RecordingSleeper::default();
         let mut phase = FixedRuntimePhaseProvider::pending();
+        let lifecycle_status = NoopSystemLifecycleStatusProvider;
 
         let mut output = Vec::new();
         let outcome = run_screen_on_with_outcome_for_event(
@@ -1311,6 +1486,7 @@ mod tests {
                 wol_sender: &wol,
                 sleeper: &sleeper,
                 phase_provider: &mut phase,
+                lifecycle_status: &lifecycle_status,
             },
             RuntimeEvent::new(
                 EventSource::AuxiliaryInput,
@@ -1331,6 +1507,51 @@ mod tests {
     }
 
     #[test]
+    fn session_screen_on_is_ineligible_while_system_restore_is_pending() {
+        let temp_dir = TestDir::new("screen-phase-on-system-restore-pending");
+        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
+        marker.create().expect("create marker");
+        let mock = MockBscpylgtv::new("screen-phase-on-system-restore-pending-tv");
+        mock.set_screen_on(false);
+        let client = client_for_mock(&mock);
+        let wol = RecordingWakeOnLanSender::default();
+        let sleeper = RecordingSleeper::default();
+        let mut phase = FixedRuntimePhaseProvider::not_pending();
+        let lifecycle_status = FixedSystemLifecycleStatusProvider { pending: true };
+
+        let mut output = Vec::new();
+        let outcome = run_screen_on_with_outcome_for_event(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            &marker,
+            ScreenOnDeps {
+                tv_client: &client,
+                wol_sender: &wol,
+                sleeper: &sleeper,
+                phase_provider: &mut phase,
+                lifecycle_status: &lifecycle_status,
+            },
+            RuntimeEvent::new(
+                EventSource::DesktopSession,
+                RuntimeEventKind::ScreenWakeRequested,
+            ),
+        )
+        .expect("pending system restore should skip session screen on");
+
+        assert!(outcome.actions.is_empty());
+        assert_eq!(outcome.no_actions.len(), 1);
+        assert_eq!(
+            outcome.no_actions[0].reason.code,
+            DecisionReasonCode::RuntimePhaseIneligible
+        );
+        assert!(outcome.state_transitions.is_empty());
+        assert!(marker.exists());
+        assert!(mock.calls().is_empty());
+        assert!(wol.calls.borrow().is_empty());
+        assert!(rendered(&output).contains("System resume restore is pending"));
+    }
+
+    #[test]
     fn disabled_lifecycle_policy_does_not_block_session_screen_actions() {
         let temp_dir = TestDir::new("screen-phase-disabled");
         let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
@@ -1340,6 +1561,7 @@ mod tests {
         let mut config = sample_config(HdmiInput::Hdmi2);
         config.system_sleep_wake_policy = SystemSleepWakePolicy::Disabled;
         let mut phase = FixedRuntimePhaseProvider::pending();
+        let lifecycle_status = NoopSystemLifecycleStatusProvider;
 
         let mut output = Vec::new();
         let outcome = run_screen_off_with_outcome_for_event(
@@ -1349,6 +1571,7 @@ mod tests {
             &client,
             RuntimeEvent::new(EventSource::DesktopSession, RuntimeEventKind::SessionIdle),
             &mut phase,
+            &lifecycle_status,
         )
         .expect("disabled lifecycle policy should fail open");
 
@@ -1373,6 +1596,7 @@ mod tests {
         mock.set_input("HDMI_2");
         let client = client_for_mock(&mock);
         let mut phase = FixedRuntimePhaseProvider::unknown("system bus unavailable");
+        let lifecycle_status = NoopSystemLifecycleStatusProvider;
 
         let mut output = Vec::new();
         let outcome = run_screen_off_with_outcome_for_event(
@@ -1382,6 +1606,7 @@ mod tests {
             &client,
             RuntimeEvent::new(EventSource::DesktopSession, RuntimeEventKind::SessionIdle),
             &mut phase,
+            &lifecycle_status,
         )
         .expect("unknown runtime phase should fail open");
 
@@ -1468,6 +1693,12 @@ mod tests {
             }
         }
 
+        fn not_pending() -> Self {
+            Self {
+                read: RuntimePhaseRead::NotPending,
+            }
+        }
+
         fn unknown(detail: &str) -> Self {
             Self {
                 read: RuntimePhaseRead::Unknown {
@@ -1480,6 +1711,16 @@ mod tests {
     impl RuntimePhaseProvider for FixedRuntimePhaseProvider {
         fn machine_sleep_pending(&mut self) -> RuntimePhaseRead {
             self.read.clone()
+        }
+    }
+
+    struct FixedSystemLifecycleStatusProvider {
+        pending: bool,
+    }
+
+    impl SystemLifecycleStatusProvider for FixedSystemLifecycleStatusProvider {
+        fn system_restore_pending(&self) -> bool {
+            self.pending
         }
     }
 

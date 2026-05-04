@@ -309,7 +309,6 @@ fn decide_restore_after_system_sleep_start(
     }
 
     let mut outcome = PolicyOutcome::new()
-        .with_state_transition(clear_system_marker(TransitionReasonCode::RestoreCompleted))
         .with_action(
             ActionKind::TvSystemResumeRestore,
             DecisionReason::new(DecisionReasonCode::RuntimeEvent),
@@ -334,6 +333,17 @@ fn decide_restore_input_succeeded() -> PolicyOutcome {
 
 fn decide_restore_input_exhausted(message: &'static str) -> PolicyOutcome {
     PolicyOutcome::new().with_diagnostic(Diagnostic::warning(message))
+}
+
+fn decide_system_resume_input_succeeded() -> PolicyOutcome {
+    PolicyOutcome::new()
+        .with_state_transition(clear_system_marker(TransitionReasonCode::RestoreCompleted))
+}
+
+fn decide_system_resume_input_exhausted(message: &'static str) -> PolicyOutcome {
+    PolicyOutcome::new()
+        .with_diagnostic(Diagnostic::warning(message))
+        .with_state_transition(clear_system_marker(TransitionReasonCode::TransportFailure))
 }
 
 fn decide_shutdown_after_reboot(
@@ -1090,7 +1100,9 @@ pub(crate) fn restore_after_system_sleep_with_outcome<
             DecisionReasonCode::RuntimeEvent,
         ));
         if tv.input().set(config.input).is_ok() {
-            outcome.merge(decide_restore_input_succeeded());
+            let success_outcome = decide_system_resume_input_succeeded();
+            apply_system_screen_marker_transitions(marker, &success_outcome)?;
+            outcome.merge(success_outcome);
             writeln!(
                 writer,
                 "LG Buddy Startup: TV turned on and set to {}.",
@@ -1122,9 +1134,10 @@ pub(crate) fn restore_after_system_sleep_with_outcome<
         "LG Buddy Startup: set_input failed after {STARTUP_WAKE_ATTEMPTS} attempts"
     )?;
     writer.flush()?;
-    outcome.merge(decide_restore_input_exhausted(
-        "system resume input restore exhausted retries",
-    ));
+    let exhausted_outcome =
+        decide_system_resume_input_exhausted("system resume input restore exhausted retries");
+    apply_system_screen_marker_transitions(marker, &exhausted_outcome)?;
+    outcome.merge(exhausted_outcome);
     Ok(outcome)
 }
 
@@ -1773,13 +1786,7 @@ mod tests {
             aggressive_missing.outcome.actions[0].kind,
             ActionKind::TvSystemResumeRestore
         );
-        assert_eq!(
-            aggressive_missing.outcome.state_transitions,
-            vec![StateTransition::clear_marker(
-                StateMarker::SystemScreenOwnership,
-                TransitionReason::new(TransitionReasonCode::RestoreCompleted),
-            )]
-        );
+        assert!(aggressive_missing.outcome.state_transitions.is_empty());
     }
 
     #[test]

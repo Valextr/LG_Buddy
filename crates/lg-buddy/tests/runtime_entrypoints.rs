@@ -295,6 +295,50 @@ fn session_dispatcher_skips_screen_action_while_logind_reports_sleep_pending() {
 }
 
 #[test]
+fn session_dispatcher_skips_screen_restore_while_system_resume_restore_is_pending() {
+    let mut env = TestEnv::new();
+    let logind = MockSystemLogind::new("entrypoint-monitor-system-restore-pending-logind");
+    logind.reset();
+    logind.set_preparing_for_sleep(false);
+
+    let mock = MockBscpylgtv::new("entrypoint-monitor-system-restore-pending-tv");
+    mock.set_screen_on(false);
+    let wrapper = mock.command_wrapper("entrypoint-monitor-system-restore-pending-wrapper");
+
+    let config = TestConfigFile::new("entrypoint-monitor-system-restore-pending-config");
+    config.write_sample("HDMI_2");
+
+    let runtime = RuntimeStateLayout::new("entrypoint-monitor-system-restore-pending-runtime");
+    runtime.create_session_marker();
+    runtime.create_system_marker();
+
+    env.set("DBUS_SYSTEM_BUS_ADDRESS", logind.address());
+    env.set("LG_BUDDY_CONFIG", config.path());
+    env.set("LG_BUDDY_BSCPYLGTV_COMMAND", wrapper.path());
+    env.set("LG_BUDDY_SESSION_RUNTIME_DIR", runtime.session_dir());
+    env.set("LG_BUDDY_SYSTEM_RUNTIME_DIR", runtime.system_dir());
+
+    let mut output = Vec::new();
+    let mut dispatcher = SessionEventDispatcher::new(RuntimeActionExecutor);
+    dispatcher
+        .dispatch_event(&mut output, SessionEvent::Active)
+        .expect("session active dispatch should succeed");
+
+    runtime.assert_session_marker_exists();
+    runtime.assert_system_marker_exists();
+    assert!(mock.calls().is_empty());
+    let output = String::from_utf8(output).expect("utf8 output");
+    assert!(
+        output.contains("System resume restore is pending"),
+        "output was: {output}"
+    );
+    assert!(
+        output.contains("Skipping session screen action"),
+        "output was: {output}"
+    );
+}
+
+#[test]
 fn run_lifecycle_monitor_uses_logind_resume_signal_and_runtime_restore() {
     let mut env = TestEnv::new();
     let logind = MockSystemLogind::new("entrypoint-lifecycle-logind");
