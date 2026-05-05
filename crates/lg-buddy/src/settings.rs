@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use crate::config::{
     parse_config_entries, resolve_config_path, resolve_config_path_from_env, ConfigPathError,
@@ -10,6 +12,7 @@ use crate::config::{
 };
 
 const SETTINGS_SUBCOMMANDS: &[&str] = &["list", "describe", "get", "set", "unset"];
+const SCREEN_SERVICE_NAME: &str = "LG_Buddy_screen.service";
 
 const READ_WRITE_OPERATIONS: &[SettingOperation] = &[
     SettingOperation::Get,
@@ -300,6 +303,63 @@ impl SettingsFormatter {
         Ok(())
     }
 
+    pub fn write_change<W: io::Write>(
+        &self,
+        writer: &mut W,
+        change: &SettingsChange,
+        apply: &SettingsApplyOutcome,
+    ) -> Result<(), SettingsError> {
+        let mutation = change.mutation();
+
+        match (mutation.action(), change.file_changed()) {
+            (SettingsMutationAction::Set, true) => {
+                writeln!(
+                    writer,
+                    "{}={} (saved to {})",
+                    mutation.key_name(),
+                    mutation.new_value(),
+                    change.path().display()
+                )
+                .map_err(output_error)?;
+            }
+            (SettingsMutationAction::Set, false) => {
+                writeln!(
+                    writer,
+                    "{} already set to {} ({})",
+                    mutation.key_name(),
+                    mutation.new_value(),
+                    change.path().display()
+                )
+                .map_err(output_error)?;
+            }
+            (SettingsMutationAction::Unset, true) => {
+                writeln!(
+                    writer,
+                    "{} unset (saved to {})",
+                    mutation.key_name(),
+                    change.path().display()
+                )
+                .map_err(output_error)?;
+            }
+            (SettingsMutationAction::Unset, false) => {
+                writeln!(
+                    writer,
+                    "{} already unset ({})",
+                    mutation.key_name(),
+                    change.path().display()
+                )
+                .map_err(output_error)?;
+            }
+        }
+
+        if !change.file_changed() {
+            writeln!(writer, "config: unchanged").map_err(output_error)?;
+        }
+
+        writeln!(writer, "apply: {apply}").map_err(output_error)?;
+        Ok(())
+    }
+
     fn write_single_description<W: io::Write>(
         &self,
         writer: &mut W,
@@ -354,16 +414,393 @@ impl SettingsFormatter {
 }
 
 #[derive(Debug, Clone)]
-pub struct SettingsCommandRunner {
-    store: SettingsStore,
-    formatter: SettingsFormatter,
+pub struct ConfigEnvEditor {
+    path: PathBuf,
+    lines: Vec<String>,
 }
 
-impl SettingsCommandRunner {
+impl ConfigEnvEditor {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, SettingsError> {
+        let path = path.as_ref().to_path_buf();
+        match fs::read_to_string(&path) {
+            Ok(contents) => Ok(Self::parse(path, &contents)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::empty(path)),
+            Err(err) => Err(SettingsError::ReadConfig {
+                path,
+                kind: err.kind(),
+                message: err.to_string(),
+            }),
+        }
+    }
+
+    pub fn parse(path: impl Into<PathBuf>, contents: &str) -> Self {
+        Self {
+            path: path.into(),
+            lines: contents.lines().map(str::to_string).collect(),
+        }
+    }
+
+    pub fn empty(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            lines: Vec::new(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn set(&mut self, storage_key: &str, value: SettingValue) -> bool {
+        let value = value.to_string();
+
+        if let Some(index) = self.last_key_index(storage_key) {
+            let replacement = replace_config_line_value(&self.lines[index], storage_key, &value);
+            let changed = self.lines[index] != replacement;
+            self.lines[index] = replacement;
+            changed
+        } else {
+            self.lines.push(format!("{storage_key}={value}"));
+            true
+        }
+    }
+
+    pub fn unset(&mut self, storage_key: &str) -> bool {
+        let original_len = self.lines.len();
+        self.lines
+            .retain(|line| config_line_key(line) != Some(storage_key));
+        self.lines.len() != original_len
+    }
+
+    pub fn save(&self) -> Result<(), SettingsError> {
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|err| SettingsError::WriteConfig {
+                    path: parent.to_path_buf(),
+                    message: err.to_string(),
+                })?;
+            }
+        }
+
+        fs::write(&self.path, self.render()).map_err(|err| SettingsError::WriteConfig {
+            path: self.path.clone(),
+            message: err.to_string(),
+        })
+    }
+
+    pub fn render(&self) -> String {
+        if self.lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", self.lines.join("\n"))
+        }
+    }
+
+    fn last_key_index(&self, storage_key: &str) -> Option<usize> {
+        self.lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, line)| config_line_key(line) == Some(storage_key))
+            .map(|(index, _)| index)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsMutationAction {
+    Set,
+    Unset,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SettingsMutation {
+    definition: &'static SettingDefinition,
+    old_value: SettingValue,
+    old_source: SettingSource,
+    new_value: SettingValue,
+    action: SettingsMutationAction,
+}
+
+impl SettingsMutation {
+    pub fn set(store: &SettingsStore, key: &str, value: &str) -> Result<Self, SettingsError> {
+        let definition = SETTINGS_REGISTRY.get_by_name(key)?;
+        definition.ensure_operation_supported(SettingOperation::Set)?;
+        let old = store.effective_definition(definition);
+        let new_value = definition.parse_value(value)?;
+
+        Ok(Self {
+            definition,
+            old_value: old.value(),
+            old_source: old.source(),
+            new_value,
+            action: SettingsMutationAction::Set,
+        })
+    }
+
+    pub fn unset(store: &SettingsStore, key: &str) -> Result<Self, SettingsError> {
+        let definition = SETTINGS_REGISTRY.get_by_name(key)?;
+        definition.ensure_operation_supported(SettingOperation::Unset)?;
+        let old = store.effective_definition(definition);
+
+        Ok(Self {
+            definition,
+            old_value: old.value(),
+            old_source: old.source(),
+            new_value: definition.default_value(),
+            action: SettingsMutationAction::Unset,
+        })
+    }
+
+    pub fn definition(self) -> &'static SettingDefinition {
+        self.definition
+    }
+
+    pub fn key_name(self) -> &'static str {
+        self.definition.key_name()
+    }
+
+    pub fn storage_key(self) -> &'static str {
+        self.definition.storage_key()
+    }
+
+    pub fn old_value(self) -> SettingValue {
+        self.old_value
+    }
+
+    pub fn old_source(self) -> SettingSource {
+        self.old_source
+    }
+
+    pub fn new_value(self) -> SettingValue {
+        self.new_value
+    }
+
+    pub fn action(self) -> SettingsMutationAction {
+        self.action
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsChange {
+    mutation: SettingsMutation,
+    path: PathBuf,
+    file_changed: bool,
+}
+
+impl SettingsChange {
+    pub fn mutation(&self) -> SettingsMutation {
+        self.mutation
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_changed(&self) -> bool {
+        self.file_changed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsApplyOutcome {
+    Restarted { service: &'static str },
+    NotInstalled { service: &'static str },
+    InactiveDisabled { service: &'static str },
+    Skipped { reason: String },
+    NoActionRequired,
+}
+
+impl fmt::Display for SettingsApplyOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Restarted { service } => write!(f, "restarted {service}"),
+            Self::NotInstalled { service } => {
+                write!(
+                    f,
+                    "{service} is not installed; change applies when it is installed"
+                )
+            }
+            Self::InactiveDisabled { service } => write!(
+                f,
+                "{service} is inactive and disabled; change applies when it is started"
+            ),
+            Self::Skipped { reason } => write!(f, "{reason}"),
+            Self::NoActionRequired => write!(f, "no runtime apply action required"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserServiceState {
+    Missing,
+    InactiveDisabled,
+    ActiveOrEnabled,
+}
+
+pub trait ServiceController {
+    fn systemd_actions_disabled(&self) -> bool {
+        false
+    }
+
+    fn user_service_state(&self, service: &str) -> Result<UserServiceState, SettingsError>;
+
+    fn restart_user_service(&self, service: &str) -> Result<(), SettingsError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemdUserServiceController {
+    command_path: PathBuf,
+    skip_systemd_actions: bool,
+}
+
+impl Default for SystemdUserServiceController {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl SystemdUserServiceController {
+    pub fn from_env() -> Self {
+        Self {
+            command_path: env::var_os("LG_BUDDY_SYSTEMCTL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("systemctl")),
+            skip_systemd_actions: env_truthy("LG_BUDDY_SKIP_SYSTEMD_ACTIONS"),
+        }
+    }
+
+    fn user_systemctl_status(&self, args: &[&str]) -> io::Result<bool> {
+        ProcessCommand::new(&self.command_path)
+            .arg("--user")
+            .args(args)
+            .status()
+            .map(|status| status.success())
+    }
+}
+
+impl ServiceController for SystemdUserServiceController {
+    fn systemd_actions_disabled(&self) -> bool {
+        self.skip_systemd_actions
+    }
+
+    fn user_service_state(&self, service: &str) -> Result<UserServiceState, SettingsError> {
+        if !self
+            .user_systemctl_status(&["cat", service])
+            .unwrap_or(false)
+        {
+            return Ok(UserServiceState::Missing);
+        }
+
+        let active = self
+            .user_systemctl_status(&["is-active", "--quiet", service])
+            .unwrap_or(false);
+        let enabled = self
+            .user_systemctl_status(&["is-enabled", "--quiet", service])
+            .unwrap_or(false);
+
+        if active || enabled {
+            Ok(UserServiceState::ActiveOrEnabled)
+        } else {
+            Ok(UserServiceState::InactiveDisabled)
+        }
+    }
+
+    fn restart_user_service(&self, service: &str) -> Result<(), SettingsError> {
+        let output = ProcessCommand::new(&self.command_path)
+            .arg("--user")
+            .arg("restart")
+            .arg(service)
+            .output()
+            .map_err(|err| SettingsError::Apply {
+                message: format!("could not run systemctl: {err}"),
+            })?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(SettingsError::Apply {
+                message: format_command_failure(
+                    output.status.code(),
+                    &output.stdout,
+                    &output.stderr,
+                ),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsApplier<C = SystemdUserServiceController> {
+    service_controller: C,
+}
+
+impl SettingsApplier<SystemdUserServiceController> {
+    pub fn from_env() -> Self {
+        Self {
+            service_controller: SystemdUserServiceController::from_env(),
+        }
+    }
+}
+
+impl<C: ServiceController> SettingsApplier<C> {
+    pub fn new(service_controller: C) -> Self {
+        Self { service_controller }
+    }
+
+    pub fn apply(&self, change: &SettingsChange) -> Result<SettingsApplyOutcome, SettingsError> {
+        match change.mutation().definition().apply_strategy() {
+            ApplyStrategy::RestartUserScreenService => self.apply_screen_service_restart(),
+            ApplyStrategy::PendingLifecycleService => Ok(SettingsApplyOutcome::NoActionRequired),
+        }
+    }
+
+    fn apply_screen_service_restart(&self) -> Result<SettingsApplyOutcome, SettingsError> {
+        if self.service_controller.systemd_actions_disabled() {
+            return Ok(SettingsApplyOutcome::Skipped {
+                reason: "skipped systemd apply because LG_BUDDY_SKIP_SYSTEMD_ACTIONS=1".to_string(),
+            });
+        }
+
+        match self
+            .service_controller
+            .user_service_state(SCREEN_SERVICE_NAME)?
+        {
+            UserServiceState::Missing => Ok(SettingsApplyOutcome::NotInstalled {
+                service: SCREEN_SERVICE_NAME,
+            }),
+            UserServiceState::InactiveDisabled => Ok(SettingsApplyOutcome::InactiveDisabled {
+                service: SCREEN_SERVICE_NAME,
+            }),
+            UserServiceState::ActiveOrEnabled => {
+                self.service_controller
+                    .restart_user_service(SCREEN_SERVICE_NAME)?;
+                Ok(SettingsApplyOutcome::Restarted {
+                    service: SCREEN_SERVICE_NAME,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SettingsCommandRunner<C = SystemdUserServiceController> {
+    store: SettingsStore,
+    formatter: SettingsFormatter,
+    applier: SettingsApplier<C>,
+}
+
+impl SettingsCommandRunner<SystemdUserServiceController> {
     pub fn new(store: SettingsStore) -> Self {
+        Self::with_applier(store, SettingsApplier::from_env())
+    }
+}
+
+impl<C: ServiceController> SettingsCommandRunner<C> {
+    pub fn with_applier(store: SettingsStore, applier: SettingsApplier<C>) -> Self {
         Self {
             store,
             formatter: SettingsFormatter,
+            applier,
         }
     }
 
@@ -391,13 +828,32 @@ impl SettingsCommandRunner {
                 let setting = self.store.effective_by_name(&key)?;
                 self.formatter.write_get(writer, setting)
             }
-            SettingsCommand::Set { .. } => {
-                Err(SettingsError::WriteCommandUnavailable { command: "set" })
+            SettingsCommand::Set { key, value } => {
+                let mutation = SettingsMutation::set(&self.store, &key, &value)?;
+                let change = persist_settings_mutation(self.store.path(), mutation)?;
+                let apply = self.apply_after_persist(&change)?;
+                self.formatter.write_change(writer, &change, &apply)
             }
-            SettingsCommand::Unset(_) => {
-                Err(SettingsError::WriteCommandUnavailable { command: "unset" })
+            SettingsCommand::Unset(key) => {
+                let mutation = SettingsMutation::unset(&self.store, &key)?;
+                let change = persist_settings_mutation(self.store.path(), mutation)?;
+                let apply = self.apply_after_persist(&change)?;
+                self.formatter.write_change(writer, &change, &apply)
             }
         }
+    }
+
+    fn apply_after_persist(
+        &self,
+        change: &SettingsChange,
+    ) -> Result<SettingsApplyOutcome, SettingsError> {
+        self.applier
+            .apply(change)
+            .map_err(|err| SettingsError::ApplyAfterPersist {
+                key: change.mutation().key_name().to_string(),
+                path: change.path().to_path_buf(),
+                message: err.to_string(),
+            })
     }
 }
 
@@ -405,14 +861,29 @@ pub fn run_settings_command<W: io::Write>(
     command: SettingsCommand,
     writer: &mut W,
 ) -> Result<(), SettingsError> {
-    if command.is_mutation() {
-        return Err(SettingsError::WriteCommandUnavailable {
-            command: command.as_str(),
-        });
-    }
-
     let store = SettingsStore::load_from_env()?;
     SettingsCommandRunner::new(store).run(command, writer)
+}
+
+fn persist_settings_mutation(
+    path: &Path,
+    mutation: SettingsMutation,
+) -> Result<SettingsChange, SettingsError> {
+    let mut editor = ConfigEnvEditor::load(path)?;
+    let file_changed = match mutation.action() {
+        SettingsMutationAction::Set => editor.set(mutation.storage_key(), mutation.new_value()),
+        SettingsMutationAction::Unset => editor.unset(mutation.storage_key()),
+    };
+
+    if file_changed {
+        editor.save()?;
+    }
+
+    Ok(SettingsChange {
+        mutation,
+        path: editor.path().to_path_buf(),
+        file_changed,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1108,6 +1579,18 @@ pub enum SettingsError {
         kind: io::ErrorKind,
         message: String,
     },
+    WriteConfig {
+        path: PathBuf,
+        message: String,
+    },
+    Apply {
+        message: String,
+    },
+    ApplyAfterPersist {
+        key: String,
+        path: PathBuf,
+        message: String,
+    },
     WriteOutput(String),
     InvalidKey {
         key: String,
@@ -1123,9 +1606,6 @@ pub enum SettingsError {
         key: String,
         operation: SettingOperation,
     },
-    WriteCommandUnavailable {
-        command: &'static str,
-    },
     RegistryInvariant(String),
 }
 
@@ -1140,6 +1620,19 @@ impl fmt::Display for SettingsError {
                     path.display()
                 )
             }
+            Self::WriteConfig { path, message } => {
+                write!(
+                    f,
+                    "could not write settings config `{}`: {message}",
+                    path.display()
+                )
+            }
+            Self::Apply { message } => write!(f, "{message}"),
+            Self::ApplyAfterPersist { key, path, message } => write!(
+                f,
+                "setting `{key}` was saved to `{}` but could not be applied: {message}. Restart LG Buddy or rerun the command after fixing the apply error.",
+                path.display()
+            ),
             Self::WriteOutput(message) => write!(f, "{message}"),
             Self::InvalidKey { key, reason } => {
                 write!(f, "invalid setting key `{key}`: {reason}")
@@ -1160,12 +1653,6 @@ impl fmt::Display for SettingsError {
                     operation.as_str()
                 )
             }
-            Self::WriteCommandUnavailable { command } => {
-                write!(
-                    f,
-                    "`settings {command}` is not implemented yet; no changes were made"
-                )
-            }
             Self::RegistryInvariant(message) => write!(f, "{message}"),
         }
     }
@@ -1176,12 +1663,14 @@ impl std::error::Error for SettingsError {
         match self {
             Self::ConfigPath(err) => Some(err),
             Self::ReadConfig { .. }
+            | Self::WriteConfig { .. }
+            | Self::Apply { .. }
+            | Self::ApplyAfterPersist { .. }
             | Self::WriteOutput(_)
             | Self::InvalidKey { .. }
             | Self::UnknownKey(_)
             | Self::InvalidValue { .. }
             | Self::UnsupportedOperation { .. }
-            | Self::WriteCommandUnavailable { .. }
             | Self::RegistryInvariant(_) => None,
         }
     }
@@ -1215,6 +1704,71 @@ fn format_aliases(aliases: &[SettingAlias]) -> String {
 
 fn output_error(err: io::Error) -> SettingsError {
     SettingsError::WriteOutput(err.to_string())
+}
+
+fn config_line_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let (key, _) = trimmed.split_once('=')?;
+    Some(key.trim())
+}
+
+fn replace_config_line_value(line: &str, storage_key: &str, value: &str) -> String {
+    let indentation: String = line
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .collect();
+    let suffix = line
+        .split_once('=')
+        .map(|(_, existing_value)| config_value_suffix(existing_value))
+        .unwrap_or_default();
+
+    format!("{indentation}{storage_key}={value}{suffix}")
+}
+
+fn config_value_suffix(value: &str) -> &str {
+    let Some(comment_start) = value.find('#') else {
+        return "";
+    };
+
+    let before_comment = &value[..comment_start];
+    let suffix_start = before_comment
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_whitespace())
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+
+    &value[suffix_start..]
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn format_command_failure(status_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String {
+    let status = status_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("systemctl exited with status {status}"),
+        (false, true) => format!("systemctl exited with status {status}: {stdout}"),
+        (true, false) => format!("systemctl exited with status {status}: {stderr}"),
+        (false, false) => format!("systemctl exited with status {status}: {stderr}; {stdout}"),
+    }
 }
 
 fn validate_setting_key(value: &str) -> Result<(), &'static str> {
@@ -1272,13 +1826,16 @@ fn validate_storage_key(value: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplyStrategy, ConfigEnvReader, ConfigPathResolver, SettingKey, SettingMutability,
-        SettingOperation, SettingSource, SettingType, SettingValue, SettingsCommand,
-        SettingsCommandRunner, SettingsError, SettingsParseError, SettingsStore, SETTINGS_REGISTRY,
+        ApplyStrategy, ConfigEnvReader, ConfigPathResolver, ServiceController, SettingKey,
+        SettingMutability, SettingOperation, SettingSource, SettingType, SettingValue,
+        SettingsApplier, SettingsCommand, SettingsCommandRunner, SettingsError, SettingsParseError,
+        SettingsStore, UserServiceState, SETTINGS_REGISTRY,
     };
     use crate::config::ConfigPathSources;
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1490,9 +2047,256 @@ system.sleep_wake_policy=disabled (config.env, read-only, ops: get,describe)
     }
 
     #[test]
-    fn settings_runner_rejects_write_commands_without_changes() {
-        let store = ConfigEnvReader::parse("/tmp/config.env", "").into_store();
-        let runner = SettingsCommandRunner::new(store);
+    fn settings_runner_sets_value_and_restarts_active_screen_service() {
+        let path = unique_test_path("set");
+        fs::write(
+            &path,
+            "\
+tv_ip=192.168.1.42
+screen_backend=swayidle # keep backend comment
+screen_idle_timeout=300
+",
+        )
+        .unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let fake_service = FakeServiceController::active_or_enabled();
+        let restarts = fake_service.restarts.clone();
+        let runner = SettingsCommandRunner::with_applier(store, SettingsApplier::new(fake_service));
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Set {
+                    key: "screen.backend".to_string(),
+                    value: "gnome".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(restarts.get(), 1);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "\
+tv_ip=192.168.1.42
+screen_backend=gnome # keep backend comment
+screen_idle_timeout=300
+"
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("screen.backend=gnome (saved to "));
+        assert!(output.contains("apply: restarted LG_Buddy_screen.service\n"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_unsets_value_and_removes_all_duplicate_keys() {
+        let path = unique_test_path("unset");
+        fs::write(
+            &path,
+            "\
+screen_backend=swayidle
+screen_idle_timeout=120
+screen_idle_timeout=450
+screen_restore_policy=aggressive
+",
+        )
+        .unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::missing()),
+        );
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Unset("screen.idle_timeout".to_string()),
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "\
+screen_backend=swayidle
+screen_restore_policy=aggressive
+"
+        );
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("apply: LG_Buddy_screen.service is not installed"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_unsets_absent_key_without_creating_config() {
+        let path = unique_test_path("unset-absent");
+        let _ = fs::remove_file(&path);
+        let store = ConfigEnvReader::empty(&path).into_store();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::missing()),
+        );
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Unset("screen.backend".to_string()),
+                &mut output,
+            )
+            .unwrap();
+
+        assert!(!path.exists());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("screen.backend already unset"));
+        assert!(output.contains("config: unchanged\n"));
+        assert!(output.contains("apply: LG_Buddy_screen.service is not installed"));
+    }
+
+    #[test]
+    fn settings_runner_rejects_invalid_write_without_touching_config() {
+        let path = unique_test_path("invalid");
+        fs::write(&path, "screen_backend=swayidle\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::active_or_enabled()),
+        );
+        let mut output = Vec::new();
+
+        let err = runner
+            .run(
+                SettingsCommand::Set {
+                    key: "screen.backend".to_string(),
+                    value: "kde".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, SettingsError::InvalidValue { .. }));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "screen_backend=swayidle\n"
+        );
+        assert!(output.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_rejects_unknown_write_without_touching_config() {
+        let path = unique_test_path("unknown");
+        fs::write(&path, "screen_backend=swayidle\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::active_or_enabled()),
+        );
+        let mut output = Vec::new();
+
+        let err = runner
+            .run(
+                SettingsCommand::Set {
+                    key: "screen.unknown".to_string(),
+                    value: "gnome".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap_err();
+
+        assert_eq!(err, SettingsError::UnknownKey("screen.unknown".to_string()));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "screen_backend=swayidle\n"
+        );
+        assert!(output.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_rejects_read_only_write_without_touching_config() {
+        let path = unique_test_path("readonly");
+        fs::write(&path, "system_sleep_wake_policy=disabled\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::active_or_enabled()),
+        );
+        let mut output = Vec::new();
+
+        let err = runner
+            .run(
+                SettingsCommand::Set {
+                    key: "system.sleep_wake_policy".to_string(),
+                    value: "enabled".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SettingsError::UnsupportedOperation {
+                key: "system.sleep_wake_policy".to_string(),
+                operation: SettingOperation::Set,
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "system_sleep_wake_policy=disabled\n"
+        );
+        assert!(output.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_creates_parent_directory_for_valid_write() {
+        let root = unique_test_path("parent").with_extension("");
+        let path = root.join("nested").join("config.env");
+        let _ = fs::remove_dir_all(&root);
+        let store = ConfigEnvReader::empty(&path).into_store();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::inactive_disabled()),
+        );
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Set {
+                    key: "screen.idle_timeout".to_string(),
+                    value: "600".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "screen_idle_timeout=600\n"
+        );
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("apply: LG_Buddy_screen.service is inactive and disabled"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settings_runner_reports_apply_failure_after_persisting_value() {
+        let path = unique_test_path("apply-fail");
+        fs::write(&path, "screen_backend=swayidle\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::failing_restart()),
+        );
         let mut output = Vec::new();
 
         let err = runner
@@ -1505,11 +2309,12 @@ system.sleep_wake_policy=disabled (config.env, read-only, ops: get,describe)
             )
             .unwrap_err();
 
-        assert_eq!(
-            err,
-            SettingsError::WriteCommandUnavailable { command: "set" }
-        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "screen_backend=gnome\n");
+        assert!(matches!(err, SettingsError::ApplyAfterPersist { .. }));
+        assert!(err.to_string().contains("was saved"));
         assert!(output.is_empty());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1870,5 +2675,73 @@ system.sleep_wake_policy=disabled (config.env, read-only, ops: get,describe)
             "lg-buddy-settings-{name}-{}-{nanos}.env",
             std::process::id()
         ))
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeServiceController {
+        state: UserServiceState,
+        restarts: Rc<Cell<usize>>,
+        restart_error: Option<&'static str>,
+        skip_actions: bool,
+    }
+
+    impl FakeServiceController {
+        fn active_or_enabled() -> Self {
+            Self {
+                state: UserServiceState::ActiveOrEnabled,
+                restarts: Rc::new(Cell::new(0)),
+                restart_error: None,
+                skip_actions: false,
+            }
+        }
+
+        fn inactive_disabled() -> Self {
+            Self {
+                state: UserServiceState::InactiveDisabled,
+                restarts: Rc::new(Cell::new(0)),
+                restart_error: None,
+                skip_actions: false,
+            }
+        }
+
+        fn missing() -> Self {
+            Self {
+                state: UserServiceState::Missing,
+                restarts: Rc::new(Cell::new(0)),
+                restart_error: None,
+                skip_actions: false,
+            }
+        }
+
+        fn failing_restart() -> Self {
+            Self {
+                state: UserServiceState::ActiveOrEnabled,
+                restarts: Rc::new(Cell::new(0)),
+                restart_error: Some("restart failed"),
+                skip_actions: false,
+            }
+        }
+    }
+
+    impl ServiceController for FakeServiceController {
+        fn systemd_actions_disabled(&self) -> bool {
+            self.skip_actions
+        }
+
+        fn user_service_state(&self, _service: &str) -> Result<UserServiceState, SettingsError> {
+            Ok(self.state)
+        }
+
+        fn restart_user_service(&self, _service: &str) -> Result<(), SettingsError> {
+            self.restarts.set(self.restarts.get() + 1);
+
+            if let Some(message) = self.restart_error {
+                Err(SettingsError::Apply {
+                    message: message.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
     }
 }
