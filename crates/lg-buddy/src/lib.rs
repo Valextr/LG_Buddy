@@ -9,6 +9,7 @@ pub mod runtime_phase;
 pub mod screen;
 pub mod session;
 pub mod session_bus;
+pub mod settings;
 pub mod sources;
 pub mod state;
 pub mod tv;
