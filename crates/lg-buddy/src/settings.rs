@@ -20,9 +20,6 @@ const READ_WRITE_OPERATIONS: &[SettingOperation] = &[
     SettingOperation::Set,
     SettingOperation::Unset,
 ];
-const READ_ONLY_OPERATIONS: &[SettingOperation] =
-    &[SettingOperation::Get, SettingOperation::Describe];
-
 const EMPTY_ALIASES: &[SettingAlias] = &[];
 const SCREEN_RESTORE_POLICY_ALIASES: &[SettingAlias] = &[SettingAlias {
     from: "marker_only",
@@ -81,9 +78,9 @@ const SETTING_DEFINITIONS: &[SettingDefinition] = &[
             aliases: EMPTY_ALIASES,
         }),
         default_value: SettingValue::Enum("enabled"),
-        mutability: SettingMutability::ReadOnly,
-        operations: READ_ONLY_OPERATIONS,
-        apply_strategy: ApplyStrategy::PendingLifecycleService,
+        mutability: SettingMutability::ReadWrite,
+        operations: READ_WRITE_OPERATIONS,
+        apply_strategy: ApplyStrategy::RuntimePolicyOnly,
         description: "System sleep and wake policy for lifecycle hooks.",
     },
 ];
@@ -752,7 +749,7 @@ impl<C: ServiceController> SettingsApplier<C> {
     pub fn apply(&self, change: &SettingsChange) -> Result<SettingsApplyOutcome, SettingsError> {
         match change.mutation().definition().apply_strategy() {
             ApplyStrategy::RestartUserScreenService => self.apply_screen_service_restart(),
-            ApplyStrategy::PendingLifecycleService => Ok(SettingsApplyOutcome::NoActionRequired),
+            ApplyStrategy::RuntimePolicyOnly => Ok(SettingsApplyOutcome::NoActionRequired),
         }
     }
 
@@ -1561,14 +1558,14 @@ impl fmt::Display for SettingOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyStrategy {
     RestartUserScreenService,
-    PendingLifecycleService,
+    RuntimePolicyOnly,
 }
 
 impl ApplyStrategy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RestartUserScreenService => "restart-user-screen-service",
-            Self::PendingLifecycleService => "pending-lifecycle-service",
+            Self::RuntimePolicyOnly => "runtime-policy-only",
         }
     }
 }
@@ -1962,7 +1959,7 @@ mod tests {
 screen.backend=gnome (config.env, read-write, ops: get,describe,set,unset)
 screen.idle_timeout=300 (default, read-write, ops: get,describe,set,unset)
 screen.restore_policy=conservative (default, read-write, ops: get,describe,set,unset)
-system.sleep_wake_policy=disabled (config.env, read-only, ops: get,describe)
+system.sleep_wake_policy=disabled (config.env, read-write, ops: get,describe,set,unset)
 "
         );
     }
@@ -2028,7 +2025,7 @@ system.sleep_wake_policy=disabled (config.env, read-only, ops: get,describe)
         assert!(output.contains("screen.idle_timeout\n"));
         assert!(output.contains("  range: 1..=86400\n"));
         assert!(output.contains("system.sleep_wake_policy\n"));
-        assert!(output.contains("  supported operations: get, describe\n"));
+        assert!(output.contains("  supported operations: get, describe, set, unset\n"));
     }
 
     #[test]
@@ -2221,17 +2218,16 @@ screen_restore_policy=aggressive
     }
 
     #[test]
-    fn settings_runner_rejects_read_only_write_without_touching_config() {
-        let path = unique_test_path("readonly");
+    fn settings_runner_sets_lifecycle_policy_without_service_restart() {
+        let path = unique_test_path("lifecycle-policy");
         fs::write(&path, "system_sleep_wake_policy=disabled\n").unwrap();
         let store = SettingsStore::load(&path).unwrap();
-        let runner = SettingsCommandRunner::with_applier(
-            store,
-            SettingsApplier::new(FakeServiceController::active_or_enabled()),
-        );
+        let fake_service = FakeServiceController::active_or_enabled();
+        let restarts = fake_service.restarts.clone();
+        let runner = SettingsCommandRunner::with_applier(store, SettingsApplier::new(fake_service));
         let mut output = Vec::new();
 
-        let err = runner
+        runner
             .run(
                 SettingsCommand::Set {
                     key: "system.sleep_wake_policy".to_string(),
@@ -2239,20 +2235,16 @@ screen_restore_policy=aggressive
                 },
                 &mut output,
             )
-            .unwrap_err();
+            .unwrap();
 
         assert_eq!(
-            err,
-            SettingsError::UnsupportedOperation {
-                key: "system.sleep_wake_policy".to_string(),
-                operation: SettingOperation::Set,
-            }
-        );
-        assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "system_sleep_wake_policy=disabled\n"
+            "system_sleep_wake_policy=enabled\n"
         );
-        assert!(output.is_empty());
+        assert_eq!(restarts.get(), 0);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("system.sleep_wake_policy=enabled (saved to "));
+        assert!(output.contains("apply: no runtime apply action required\n"));
 
         let _ = fs::remove_file(path);
     }
@@ -2632,18 +2624,19 @@ screen_restore_policy=aggressive
         let sleep_definition = SETTINGS_REGISTRY
             .get_by_name("system.sleep_wake_policy")
             .unwrap();
-        assert_eq!(sleep_definition.mutability(), SettingMutability::ReadOnly);
+        assert_eq!(sleep_definition.mutability(), SettingMutability::ReadWrite);
         assert_eq!(
             sleep_definition.supported_operations(),
-            &[SettingOperation::Get, SettingOperation::Describe]
+            &[
+                SettingOperation::Get,
+                SettingOperation::Describe,
+                SettingOperation::Set,
+                SettingOperation::Unset,
+            ]
         );
-        assert_eq!(
-            sleep_definition.ensure_operation_supported(SettingOperation::Set),
-            Err(SettingsError::UnsupportedOperation {
-                key: "system.sleep_wake_policy".to_string(),
-                operation: SettingOperation::Set,
-            })
-        );
+        sleep_definition
+            .ensure_operation_supported(SettingOperation::Set)
+            .unwrap();
     }
 
     #[test]
@@ -2663,7 +2656,7 @@ screen_restore_policy=aggressive
         assert!(matches!(sleep_policy.value_type(), SettingType::Enum(_)));
         assert_eq!(
             sleep_policy.apply_strategy(),
-            ApplyStrategy::PendingLifecycleService
+            ApplyStrategy::RuntimePolicyOnly
         );
     }
 

@@ -7,15 +7,15 @@ Feature: Settings CLI
     Then the command succeeds
     And stdout contains "screen.backend=auto (config.env, read-write, ops: get,describe,set,unset)"
     And stdout contains "screen.restore_policy=conservative (default, read-write, ops: get,describe,set,unset)"
-    And stdout contains "system.sleep_wake_policy=enabled (default, read-only, ops: get,describe)"
+    And stdout contains "system.sleep_wake_policy=enabled (default, read-write, ops: get,describe,set,unset)"
 
-  Scenario: settings describe shows read-only lifecycle operations
+  Scenario: settings describe shows lifecycle policy operations
     Given a temporary LG Buddy config using input HDMI_2
     When I run the command "settings describe system.sleep_wake_policy"
     Then the command succeeds
     And stdout contains "system.sleep_wake_policy"
-    And stdout contains "mutability: read-only"
-    And stdout contains "supported operations: get, describe"
+    And stdout contains "mutability: read-write"
+    And stdout contains "supported operations: get, describe, set, unset"
 
   Scenario: settings set writes config.env and reports skipped apply
     Given a temporary LG Buddy config using input HDMI_2
@@ -64,10 +64,10 @@ Feature: Settings CLI
     And config.env contains "screen_backend=gnome"
     And systemctl was invoked with "--user restart LG_Buddy_screen.service"
 
-  Scenario: read-only lifecycle settings are rejected without changing config.env
+  Scenario: settings set writes lifecycle policy without restarting services
     Given a temporary LG Buddy config using input HDMI_2
-    And the current config is remembered
     When I run the command "settings set system.sleep_wake_policy disabled"
-    Then the command fails
-    And stderr contains "setting `system.sleep_wake_policy` does not support `set`"
-    And config.env is unchanged
+    Then the command succeeds
+    And stdout contains "system.sleep_wake_policy=disabled"
+    And stdout contains "apply: no runtime apply action required"
+    And config.env contains "system_sleep_wake_policy=disabled"

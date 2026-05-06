@@ -98,9 +98,10 @@ choice.
 `system_sleep_wake_policy` follows the same model:
 
 - automatic system sleep/wake handling should default to enabled
-- users who do not want it should opt out through `config.env`
+- users who do not want it should opt out through `config.env` or
+  `lg-buddy settings set system.sleep_wake_policy disabled`
 - the installer should not ask every user whether sleep/wake automation should
   be enabled
 - the supported values are `enabled` and `disabled`
-- it remains read-only through `lg-buddy settings` until the command can safely
-  apply lifecycle service and NetworkManager hook ownership changes
+- lifecycle service and NetworkManager hook installation are integration
+  topology, while this setting controls runtime policy

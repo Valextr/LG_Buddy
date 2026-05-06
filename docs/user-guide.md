@@ -178,7 +178,7 @@ Current structured settings:
 | `screen.backend` | `screen_backend` | `get`, `describe`, `set`, `unset` |
 | `screen.idle_timeout` | `screen_idle_timeout` | `get`, `describe`, `set`, `unset` |
 | `screen.restore_policy` | `screen_restore_policy` | `get`, `describe`, `set`, `unset` |
-| `system.sleep_wake_policy` | `system_sleep_wake_policy` | `get`, `describe` |
+| `system.sleep_wake_policy` | `system_sleep_wake_policy` | `get`, `describe`, `set`, `unset` |
 
 `screen_idle_timeout` is the inactivity threshold in seconds used by the session monitor.
 LG Buddy currently uses that timeout for both the GNOME and `swayidle` backends.
@@ -192,17 +192,15 @@ LG Buddy currently uses that timeout for both the GNOME and `swayidle` backends.
 
 `system_sleep_wake_policy` controls automatic system sleep/wake TV handling:
 
-- `enabled`: default behavior, install the NetworkManager pre-down gate and run
-  the logind lifecycle service
-- `disabled`: do not install an active lifecycle owner
+- `enabled`: default behavior, let the installed NetworkManager pre-down gate
+  and logind lifecycle service control the TV around system sleep and wake
+- `disabled`: leave lifecycle integration installed, but make those commands
+  no-op for sleep/wake TV handling
 
-The running lifecycle service rereads config and stops cleanly when this value
-is changed to `disabled`. To apply the installed service enable/remove state
-after changing the value, rerun `./install.sh`.
-
-`system.sleep_wake_policy` is read-only in the structured settings CLI for now.
-Write support should only be added when LG Buddy can also apply the lifecycle
-service and NetworkManager hook changes in the same command.
+The running lifecycle service rereads config and suppresses actions while this
+value is `disabled`. The NetworkManager pre-down hook also reads config on each
+invocation, so `lg-buddy settings set system.sleep_wake_policy <value>` changes
+runtime policy without reinstalling services.
 
 Example:
 

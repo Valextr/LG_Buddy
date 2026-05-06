@@ -86,7 +86,7 @@ On first use, you may need to accept a pairing prompt on the TV:
 LG Buddy is mostly automatic after installation.
 
 - To inspect settings, run `lg-buddy settings list`
-- To change supported screen settings, use `lg-buddy settings set <key> <value>`
+- To change supported settings, use `lg-buddy settings set <key> <value>`
 - To rerun full setup for TV IP, MAC address, or HDMI input, run `./configure.sh`
 - To check the screen monitor, run `systemctl --user status LG_Buddy_screen.service`
 - To remove LG Buddy, run `./uninstall.sh`
@@ -98,6 +98,7 @@ the same file that manual editing and `configure.sh` use:
 lg-buddy settings describe screen.restore_policy
 lg-buddy settings set screen.idle_timeout 600
 lg-buddy settings set screen.restore_policy aggressive
+lg-buddy settings set system.sleep_wake_policy disabled
 lg-buddy settings unset screen.restore_policy
 ```
 
@@ -116,11 +117,9 @@ Set `screen_restore_policy=aggressive` to let session wake/activity and system w
 `marker_only` is still accepted as a legacy alias for `conservative`.
 
 `system_sleep_wake_policy=enabled` is the default. Set
-`system_sleep_wake_policy=disabled` in `config.env` and rerun `./install.sh` if
-you do not want LG Buddy to control the TV around system sleep and wake. The
-structured key `system.sleep_wake_policy` is currently read-only in
-`lg-buddy settings` until lifecycle service and NetworkManager hook changes have
-a dedicated apply path.
+`system_sleep_wake_policy=disabled` if you do not want LG Buddy to control the
+TV around system sleep and wake. The lifecycle service and NetworkManager
+pre-down hook stay installed and no-op while the policy is disabled.
 
 ## More Help
 

@@ -264,32 +264,29 @@ esac\n",
 }
 
 #[test]
-fn settings_set_lifecycle_policy_is_read_only_and_leaves_config_unchanged() {
-    let config = TestConfigFile::new("entrypoint-settings-readonly-config");
+fn settings_set_lifecycle_policy_updates_config_without_systemd_apply() {
+    let config = TestConfigFile::new("entrypoint-settings-lifecycle-policy-config");
     config.write_sample("HDMI_3");
-    let original = fs::read_to_string(config.path()).expect("read original config");
 
     let mut env = TestEnv::new();
     env.set("LG_BUDDY_CONFIG", config.path());
 
     let mut output = Vec::new();
-    let err = run_command(
+    run_command(
         Command::Settings(SettingsCommand::Set {
             key: "system.sleep_wake_policy".to_string(),
             value: "disabled".to_string(),
         }),
         &mut output,
     )
-    .expect_err("lifecycle policy should remain read-only");
+    .expect("lifecycle policy should be writable");
 
-    assert!(err
-        .to_string()
-        .contains("setting `system.sleep_wake_policy` does not support `set`"));
-    assert!(output.is_empty());
-    assert_eq!(
-        fs::read_to_string(config.path()).expect("read config after rejection"),
-        original
-    );
+    assert!(fs::read_to_string(config.path())
+        .expect("read config")
+        .contains("system_sleep_wake_policy=disabled\n"));
+    let output = String::from_utf8(output).expect("settings output utf8");
+    assert!(output.contains("system.sleep_wake_policy=disabled"));
+    assert!(output.contains("apply: no runtime apply action required"));
 }
 
 #[test]
@@ -533,6 +530,7 @@ fn run_lifecycle_monitor_uses_logind_resume_signal_and_runtime_restore() {
     env.set("LG_BUDDY_STARTUP_INITIAL_WAKE_DELAY_SECS", "0");
     env.set("LG_BUDDY_TV_ROUTE_WAIT_ATTEMPTS", "1");
     env.set("LG_BUDDY_TV_ROUTE_WAIT_DELAY_MS", "0");
+    env.set("LG_BUDDY_LIFECYCLE_MONITOR_TEST_EVENT_LIMIT", "1");
 
     let (done_tx, done_rx) = mpsc::channel();
     let lifecycle_thread = thread::spawn(move || {
@@ -569,12 +567,9 @@ fn run_lifecycle_monitor_uses_logind_resume_signal_and_runtime_restore() {
     runtime.assert_system_marker_absent();
     runtime.assert_system_sleep_attempt_marker_absent();
 
-    config.append_line("system_sleep_wake_policy=disabled");
-    logind.queue_prepare_for_sleep_signal(true);
-
     let (result, output) = done_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("lifecycle monitor should exit after config is disabled");
+        .expect("lifecycle monitor should exit after test event limit");
     lifecycle_thread
         .join()
         .expect("join lifecycle monitor thread");
@@ -586,7 +581,7 @@ fn run_lifecycle_monitor_uses_logind_resume_signal_and_runtime_restore() {
     assert!(output.contains("System resumed from sleep"));
     assert!(output.contains("Session event `after-resume` requests wake restore"));
     assert!(output.contains("Wake from sleep: LG Buddy turned TV off. Restoring."));
-    assert!(output.contains("stopping lifecycle monitor"));
+    assert!(!output.contains("stopping lifecycle monitor"));
 }
 
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {

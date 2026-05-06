@@ -293,11 +293,8 @@ export LG_BUDDY_SKIP_PIP_INSTALL="1"
 assert_file "$CONFIG_FILE"
 assert_executable "$INSTALLED_BINARY"
 assert_file "$SYSTEM_SERVICE"
+assert_file "$LIFECYCLE_SERVICE"
 assert_file "$USER_SCREEN_SERVICE"
-[ ! -e "$LIFECYCLE_SERVICE" ] || {
-    echo "Lifecycle service installed despite disabled policy: $LIFECYCLE_SERVICE"
-    exit 1
-}
 [ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
     echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
     exit 1
@@ -310,10 +307,8 @@ assert_file "$USER_SCREEN_SERVICE"
     echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
     exit 1
 }
-[ ! -e "$NM_LIFECYCLE_HOOK" ] || {
-    echo "NetworkManager lifecycle hook installed despite disabled policy: $NM_LIFECYCLE_HOOK"
-    exit 1
-}
+assert_executable "$NM_LIFECYCLE_HOOK"
+grep -q 'lg-buddy nm-pre-down' "$NM_LIFECYCLE_HOOK"
 grep -q '^system_sleep_wake_policy=disabled$' "$CONFIG_FILE"
 
 (
