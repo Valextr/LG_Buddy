@@ -11,19 +11,19 @@ use crate::config::{load_config, resolve_config_path_from_env, Config};
 use crate::lifecycle::ThreadSleeper;
 use crate::lifecycle::{self, JournalctlSleepDetector, NmOnlineNetworkWaiter};
 use crate::state::{ScreenOwnershipMarker, StateScope, SystemSleepAttemptState};
-use crate::tv::{BscpylgtvCommandClient, TvClient, TvDevice, UserScopedBscpylgtvCommandLauncher};
+use crate::tv::{
+    BscpylgtvCommandClient, OledBrightness, TvClient, TvDevice, UserScopedBscpylgtvCommandLauncher,
+};
 use crate::wol::UdpWakeOnLanSender;
-use crate::{RunError, StartupMode};
+use crate::{BrightnessCommand, RunError, StartupMode};
 
 const SYSTEM_PRE_SLEEP_TV_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-const BRIGHTNESS_DEFAULT_VALUE: u8 = 50;
-
 trait ReachabilityChecker {
     fn is_reachable(&self, tv_ip: Ipv4Addr) -> io::Result<bool>;
 }
 
 trait BrightnessUi {
-    fn prompt_brightness(&self, initial: u8) -> io::Result<Option<u8>>;
+    fn prompt_brightness(&self, initial: OledBrightness) -> io::Result<Option<OledBrightness>>;
     fn show_error(&self, title: &str, message: &str) -> io::Result<()>;
 }
 
@@ -147,7 +147,7 @@ impl ReachabilityChecker for PingReachabilityChecker {
 }
 
 impl BrightnessUi for ZenityBrightnessUi {
-    fn prompt_brightness(&self, initial: u8) -> io::Result<Option<u8>> {
+    fn prompt_brightness(&self, initial: OledBrightness) -> io::Result<Option<OledBrightness>> {
         let output = ProcessCommand::new(&self.command_path)
             .args([
                 "--scale",
@@ -165,19 +165,12 @@ impl BrightnessUi for ZenityBrightnessUi {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let value = stdout.trim().parse::<u8>().map_err(|err| {
+        let value = OledBrightness::parse(stdout.trim()).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid zenity brightness value `{}`: {err}", stdout.trim()),
+                format!("invalid zenity brightness value: {err}"),
             )
         })?;
-
-        if value > 100 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("zenity brightness value out of range: {value}"),
-            ));
-        }
 
         Ok(Some(value))
     }
@@ -259,7 +252,10 @@ pub fn run_nm_pre_down<W: Write>(writer: &mut W) -> Result<(), RunError> {
     )
 }
 
-pub fn run_brightness<W: Write>(writer: &mut W) -> Result<(), RunError> {
+pub fn run_brightness<W: Write>(
+    writer: &mut W,
+    command: BrightnessCommand,
+) -> Result<(), RunError> {
     let config_path = resolve_config_path_from_env().map_err(RunError::ConfigPath)?;
     let config = load_config(&config_path).map_err(RunError::Config)?;
     let tv_client = build_tv_client(&config_path)?;
@@ -273,7 +269,7 @@ pub fn run_brightness<W: Write>(writer: &mut W) -> Result<(), RunError> {
         notifier: &notifier,
     };
 
-    run_brightness_with(writer, &config, deps)
+    run_brightness_with(writer, &config, command, deps)
 }
 
 pub fn run_startup<W: Write>(writer: &mut W, mode: StartupMode) -> Result<(), RunError> {
@@ -380,6 +376,36 @@ fn run_brightness_with<
 >(
     writer: &mut W,
     config: &Config,
+    command: BrightnessCommand,
+    deps: BrightnessDeps<'_, C, R, U, N>,
+) -> Result<(), RunError> {
+    match command {
+        BrightnessCommand::Prompt => run_brightness_prompt_with(writer, config, deps),
+        BrightnessCommand::Get => {
+            let brightness = read_oled_brightness(config, deps.tv_client)?;
+            writeln!(writer, "{brightness}")?;
+            Ok(())
+        }
+        BrightnessCommand::Set(brightness) => {
+            set_oled_brightness(config, deps.tv_client, brightness)?;
+            writeln!(
+                writer,
+                "LG Buddy Brightness: Set OLED pixel brightness to {brightness}%."
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn run_brightness_prompt_with<
+    W: Write,
+    C: TvClient,
+    R: ReachabilityChecker,
+    U: BrightnessUi,
+    N: Notifier,
+>(
+    writer: &mut W,
+    config: &Config,
     deps: BrightnessDeps<'_, C, R, U, N>,
 ) -> Result<(), RunError> {
     let tv = TvDevice::new(deps.tv_client, config.tv_ip);
@@ -401,13 +427,13 @@ fn run_brightness_with<
     let initial_brightness = tv
         .picture()
         .oled_brightness()
-        .unwrap_or(BRIGHTNESS_DEFAULT_VALUE);
+        .unwrap_or(OledBrightness::DEFAULT);
 
     let Some(brightness) = deps.ui.prompt_brightness(initial_brightness)? else {
         return Ok(());
     };
 
-    match tv.picture().set_oled_brightness(brightness) {
+    match set_oled_brightness(config, deps.tv_client, brightness) {
         Ok(_) => {
             let _ = deps
                 .notifier
@@ -420,9 +446,31 @@ fn run_brightness_with<
         }
         Err(err) => {
             let _ = deps.notifier.notify("LG TV", "Failed to set brightness");
-            Err(RunError::Policy(format!("failed to set brightness: {err}")))
+            Err(err)
         }
     }
+}
+
+fn read_oled_brightness<C: TvClient>(
+    config: &Config,
+    tv_client: &C,
+) -> Result<OledBrightness, RunError> {
+    let tv = TvDevice::new(tv_client, config.tv_ip);
+    tv.picture()
+        .oled_brightness()
+        .map_err(|err| RunError::Policy(format!("failed to read brightness: {err}")))
+}
+
+fn set_oled_brightness<C: TvClient>(
+    config: &Config,
+    tv_client: &C,
+    brightness: OledBrightness,
+) -> Result<(), RunError> {
+    let tv = TvDevice::new(tv_client, config.tv_ip);
+    tv.picture()
+        .set_oled_brightness(brightness)
+        .map(|_| ())
+        .map_err(|err| RunError::Policy(format!("failed to set brightness: {err}")))
 }
 
 #[cfg(test)]
@@ -431,10 +479,7 @@ mod tests {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
     }
 
-    use super::{
-        run_brightness_with, BrightnessDeps, BrightnessUi, Notifier, ReachabilityChecker,
-        BRIGHTNESS_DEFAULT_VALUE,
-    };
+    use super::{run_brightness_with, BrightnessDeps, BrightnessUi, Notifier, ReachabilityChecker};
     use crate::config::{
         Config, HdmiInput, MacAddress, ScreenBackend, ScreenRestorePolicy, SystemSleepWakePolicy,
     };
@@ -445,9 +490,9 @@ mod tests {
     use crate::screen::{run_screen_off_with, run_screen_on_with};
     use crate::state::ScreenOwnershipMarker;
     use crate::state::SystemSleepAttemptState;
-    use crate::tv::BscpylgtvCommandClient;
+    use crate::tv::{BscpylgtvCommandClient, OledBrightness};
     use crate::wol::{WakeOnLanError, WakeOnLanSender};
-    use crate::StartupMode;
+    use crate::{BrightnessCommand, StartupMode};
     use std::cell::RefCell;
     use std::ffi::CString;
     use std::fs;
@@ -1188,8 +1233,13 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        run_brightness_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
-            .expect("brightness should succeed");
+        run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Prompt,
+            deps,
+        )
+        .expect("brightness should succeed");
 
         assert_eq!(ui.initial_values(), vec![72]);
         assert!(ui.error_messages().is_empty());
@@ -1200,6 +1250,66 @@ mod tests {
         assert_eq!(mock.state_snapshot().backlight, 65);
         assert_call_commands(&mock, &["get_picture_settings", "set_settings"]);
         assert!(rendered(&output).contains("Set OLED pixel brightness to 65%."));
+    }
+
+    #[test]
+    fn brightness_get_prints_current_oled_brightness() {
+        let mock = MockBscpylgtv::new("brightness-get-tv");
+        mock.set_backlight(72);
+        let client = client_for_mock(&mock);
+        let reachability = FakeReachabilityChecker::unreachable();
+        let ui = FakeBrightnessUi::cancelled();
+        let notifier = RecordingNotifier::default();
+        let deps = BrightnessDeps {
+            tv_client: &client,
+            reachability: &reachability,
+            ui: &ui,
+            notifier: &notifier,
+        };
+
+        let mut output = Vec::new();
+        run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Get,
+            deps,
+        )
+        .expect("brightness get should succeed");
+
+        assert_eq!(rendered(&output).trim(), "72");
+        assert!(ui.initial_values().is_empty());
+        assert!(notifier.messages().is_empty());
+        assert_call_commands(&mock, &["get_picture_settings"]);
+    }
+
+    #[test]
+    fn brightness_set_updates_oled_brightness_without_dialog() {
+        let mock = MockBscpylgtv::new("brightness-set-tv");
+        let client = client_for_mock(&mock);
+        let reachability = FakeReachabilityChecker::unreachable();
+        let ui = FakeBrightnessUi::cancelled();
+        let notifier = RecordingNotifier::default();
+        let deps = BrightnessDeps {
+            tv_client: &client,
+            reachability: &reachability,
+            ui: &ui,
+            notifier: &notifier,
+        };
+
+        let mut output = Vec::new();
+        run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Set(OledBrightness::new(61).expect("valid brightness")),
+            deps,
+        )
+        .expect("brightness set should succeed");
+
+        assert_eq!(mock.state_snapshot().backlight, 61);
+        assert!(ui.initial_values().is_empty());
+        assert!(notifier.messages().is_empty());
+        assert_call_commands(&mock, &["set_settings"]);
+        assert!(rendered(&output).contains("Set OLED pixel brightness to 61%."));
     }
 
     #[test]
@@ -1217,8 +1327,13 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        run_brightness_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
-            .expect("cancel should exit cleanly");
+        run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Prompt,
+            deps,
+        )
+        .expect("cancel should exit cleanly");
 
         assert_eq!(ui.initial_values(), vec![50]);
         assert_call_commands(&mock, &["get_picture_settings"]);
@@ -1241,8 +1356,13 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        let err = run_brightness_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
-            .expect_err("unreachable tv should fail");
+        let err = run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Prompt,
+            deps,
+        )
+        .expect_err("unreachable tv should fail");
 
         assert!(matches!(err, crate::RunError::Policy(_)));
         assert!(mock.calls().is_empty());
@@ -1272,10 +1392,15 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        run_brightness_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
-            .expect("fallback to default brightness should still allow cancellation");
+        run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Prompt,
+            deps,
+        )
+        .expect("fallback to default brightness should still allow cancellation");
 
-        assert_eq!(ui.initial_values(), vec![BRIGHTNESS_DEFAULT_VALUE]);
+        assert_eq!(ui.initial_values(), vec![50]);
         assert_call_commands(&mock, &["get_picture_settings"]);
         assert!(notifier.messages().is_empty());
         assert!(rendered(&output).is_empty());
@@ -1297,8 +1422,13 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        let err = run_brightness_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
-            .expect_err("tv command failure should fail");
+        let err = run_brightness_with(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            BrightnessCommand::Prompt,
+            deps,
+        )
+        .expect_err("tv command failure should fail");
 
         assert!(matches!(err, crate::RunError::Policy(_)));
         assert_eq!(ui.initial_values(), vec![50]);
@@ -1708,7 +1838,7 @@ mod tests {
     }
 
     struct FakeBrightnessUi {
-        selection: io::Result<Option<u8>>,
+        selection: io::Result<Option<OledBrightness>>,
         initial_values: RefCell<Vec<u8>>,
         error_messages: RefCell<Vec<(String, String)>>,
     }
@@ -1716,7 +1846,9 @@ mod tests {
     impl FakeBrightnessUi {
         fn selected(value: u8) -> Self {
             Self {
-                selection: Ok(Some(value)),
+                selection: Ok(Some(
+                    OledBrightness::new(value).expect("fake brightness value should be valid"),
+                )),
                 initial_values: RefCell::new(Vec::new()),
                 error_messages: RefCell::new(Vec::new()),
             }
@@ -1740,8 +1872,8 @@ mod tests {
     }
 
     impl BrightnessUi for FakeBrightnessUi {
-        fn prompt_brightness(&self, initial: u8) -> io::Result<Option<u8>> {
-            self.initial_values.borrow_mut().push(initial);
+        fn prompt_brightness(&self, initial: OledBrightness) -> io::Result<Option<OledBrightness>> {
+            self.initial_values.borrow_mut().push(initial.as_percent());
             match &self.selection {
                 Ok(value) => Ok(*value),
                 Err(err) => Err(io::Error::new(err.kind(), err.to_string())),

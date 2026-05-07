@@ -277,16 +277,21 @@ The binary currently supports these commands:
 - `sleep`
 - `nm-pre-down`
 - `brightness`
+- `brightness get`
+- `brightness set <0-100>`
 - `screen-off`
 - `screen-on`
 - `monitor`
 - `lifecycle`
 - `detect-backend`
+- `settings`
 
 `lib.rs` parses the command line into a typed command enum and dispatches into
 the runtime command handlers in `commands.rs` and `session/runner.rs`.
 `commands.rs` then delegates screen and lifecycle decisions to their domain
 modules and delegates platform ingestion to `sources/`.
+The brightness command uses the TV picture abstraction in `tv.rs` for typed
+OLED brightness validation and live TV read/write operations.
 
 This keeps CLI parsing separate from operational behavior.
 
