@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod events;
 pub mod lifecycle;
+pub mod notifications;
 pub mod policy;
 pub mod runtime_phase;
 pub mod screen;
@@ -273,7 +274,7 @@ Settings:
   settings unset <key>
 
 Updates:
-  updates check [--channel stable|prerelease]
+  updates check [--channel stable|prerelease] [--notify]
 "
     )
 }
@@ -563,14 +564,18 @@ mod tests {
         assert_eq!(
             parse_args(["updates", "check"]),
             Ok(ParseOutcome::Command(Command::Updates(
-                UpdatesCommand::Check { channel: None }
+                UpdatesCommand::Check {
+                    channel: None,
+                    notify: false,
+                }
             )))
         );
         assert_eq!(
             parse_args(["updates", "check", "--channel", "stable"]),
             Ok(ParseOutcome::Command(Command::Updates(
                 UpdatesCommand::Check {
-                    channel: Some(UpdateChannel::Stable)
+                    channel: Some(UpdateChannel::Stable),
+                    notify: false,
                 }
             )))
         );
@@ -578,7 +583,35 @@ mod tests {
             parse_args(["updates", "check", "--channel", "prerelease"]),
             Ok(ParseOutcome::Command(Command::Updates(
                 UpdatesCommand::Check {
-                    channel: Some(UpdateChannel::Prerelease)
+                    channel: Some(UpdateChannel::Prerelease),
+                    notify: false,
+                }
+            )))
+        );
+        assert_eq!(
+            parse_args(["updates", "check", "--notify"]),
+            Ok(ParseOutcome::Command(Command::Updates(
+                UpdatesCommand::Check {
+                    channel: None,
+                    notify: true,
+                }
+            )))
+        );
+        assert_eq!(
+            parse_args(["updates", "check", "--notify", "--channel", "stable"]),
+            Ok(ParseOutcome::Command(Command::Updates(
+                UpdatesCommand::Check {
+                    channel: Some(UpdateChannel::Stable),
+                    notify: true,
+                }
+            )))
+        );
+        assert_eq!(
+            parse_args(["updates", "check", "--channel", "prerelease", "--notify"]),
+            Ok(ParseOutcome::Command(Command::Updates(
+                UpdatesCommand::Check {
+                    channel: Some(UpdateChannel::Prerelease),
+                    notify: true,
                 }
             )))
         );
@@ -692,6 +725,10 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(
+            parse_args(["updates", "check", "--notify", "--notify"]),
+            Err(ParseError::Updates(UpdatesParseError::DuplicateNotify))
+        );
     }
 
     #[test]
@@ -744,7 +781,7 @@ mod tests {
             "settings get <key>",
             "settings set <key> <value>",
             "settings unset <key>",
-            "updates check [--channel stable|prerelease]",
+            "updates check [--channel stable|prerelease] [--notify]",
         ] {
             assert!(help.contains(command), "missing `{command}` from help");
         }

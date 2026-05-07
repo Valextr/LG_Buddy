@@ -69,6 +69,7 @@ flowchart LR
         GNOME["GNOME session bus<br/>ScreenSaver / Mutter signals"]
         SWAY["swayidle<br/>idle hooks"]
         INPUT["Linux input devices<br/>gamepads / wheels / device events"]
+        FDO_NOTIFY["desktop notification service<br/>org.freedesktop.Notifications"]
     end
 
     subgraph SystemLifecycle["System Lifecycle"]
@@ -89,6 +90,7 @@ flowchart LR
         COMMANDS["commands.rs<br/>CLI/API dependency assembly"]
         EVENTS["events.rs<br/>canonical runtime events"]
         POLICY["policy.rs<br/>action / no-action / state trail"]
+        NOTIFICATIONS["notifications.rs<br/>native desktop notifications"]
         SCREEN["screen.rs<br/>session screen policy"]
         LIFECYCLE["lifecycle.rs<br/>machine lifecycle policy"]
         PHASE["runtime_phase.rs<br/>machine sleep phase provider"]
@@ -140,6 +142,7 @@ flowchart LR
     MAIN --> COMMANDS
     COMMANDS --> EVENTS
     COMMANDS --> NMGATE
+    COMMANDS --> NOTIFICATIONS
     COMMANDS --> SCREEN
     COMMANDS --> LIFECYCLE
     SCREEN --> POLICY
@@ -151,6 +154,7 @@ flowchart LR
     SADAPTER -.->|"modeled SessionEvent hooks"| SESSIONMODEL
     INPUT --> GAMEPAD
     GAMEPAD -->|"UserActivity"| RUNNER
+    NOTIFICATIONS --> FDO_NOTIFY
     SESSIONMODEL --> RUNNER
 
     RUNNER -->|"Idle / Active / WakeRequested /<br/>UserActivity"| SCREEN
@@ -183,6 +187,10 @@ The intended split is:
 - `policy.rs`
   - explicit policy outcomes: selected actions, no-action decisions,
     diagnostics, and state-transition trail
+- `notifications.rs`
+  - native desktop notification dispatch through
+    `org.freedesktop.Notifications`
+  - passive notification delivery for brightness and explicit update checks
 - `screen.rs`
   - pure session screen blank and restore policy decisions over already-read
     observations
@@ -305,14 +313,15 @@ The binary currently supports these commands:
 - `lifecycle`
 - `detect-backend`
 - `settings`
-- `updates check [--channel stable|prerelease]`
+- `updates check [--channel stable|prerelease] [--notify]`
 
 `lib.rs` parses the command line into a typed command enum and dispatches into
 the runtime command handlers in `commands.rs` and `session/runner.rs`.
 `commands.rs` then delegates screen and lifecycle decisions to their domain
 modules and delegates platform ingestion to `sources/`. The on-demand
 `updates check` command consumes the GitHub Releases API without entering the
-screen, lifecycle, settings, notification, or scheduling paths.
+screen, lifecycle, settings, or scheduling paths. It enters notification
+dispatch only when `--notify` is passed and an update is available.
 The `brightness get` and `brightness set` commands use the TV picture
 abstraction in `tv.rs` for typed OLED brightness validation and live TV
 read/write operations. The interactive brightness dialog delegates its TV

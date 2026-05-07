@@ -39,6 +39,7 @@ lg-buddy brightness get
 lg-buddy brightness set 65
 lg-buddy --version
 lg-buddy updates check
+lg-buddy updates check --notify
 ```
 
 In normal use, systemd starts the relevant commands automatically. Most users
@@ -52,7 +53,8 @@ metadata when the binary was built as an official release artifact.
 release is available. Stable builds check stable releases by default, while
 prerelease builds check the prerelease channel, which includes both prerelease
 and stable releases. Use `--channel stable` or `--channel prerelease` to choose
-the channel explicitly.
+the channel explicitly. Add `--notify` to send a desktop notification when the
+check finds an available update.
 
 `lifecycle`, `nm-pre-down`, `sleep-pre`, and `startup wake` are normally
 service-owned system lifecycle commands. They are documented for

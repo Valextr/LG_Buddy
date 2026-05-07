@@ -11,6 +11,7 @@ use crate::auth::resolve_bscpylgtv_auth_context_from_env;
 use crate::config::{load_config, resolve_config_path_from_env, Config};
 use crate::lifecycle::ThreadSleeper;
 use crate::lifecycle::{self, JournalctlSleepDetector, NmOnlineNetworkWaiter};
+use crate::notifications::{FreedesktopNotifier, Notification, NotificationError, Notifier};
 use crate::state::{ScreenOwnershipMarker, StateScope, SystemSleepAttemptState};
 use crate::tv::{
     BscpylgtvCommandClient, OledBrightness, TvClient, TvDevice, UserScopedBscpylgtvCommandLauncher,
@@ -33,10 +34,6 @@ trait BrightnessCli {
     fn set_brightness(&self, brightness: OledBrightness) -> Result<String, RunError>;
 }
 
-trait Notifier {
-    fn notify(&self, title: &str, message: &str) -> io::Result<()>;
-}
-
 struct SystemctlRebootDetector {
     command_path: PathBuf,
 }
@@ -50,10 +47,6 @@ struct ZenityBrightnessUi {
 }
 
 struct CurrentExeBrightnessCli {
-    command_path: PathBuf,
-}
-
-struct NotifySendNotifier {
     command_path: PathBuf,
 }
 
@@ -77,12 +70,6 @@ impl Default for PingReachabilityChecker {
 }
 
 impl Default for ZenityBrightnessUi {
-    fn default() -> Self {
-        Self::from_env()
-    }
-}
-
-impl Default for NotifySendNotifier {
     fn default() -> Self {
         Self::from_env()
     }
@@ -130,16 +117,6 @@ impl CurrentExeBrightnessCli {
             .args(args)
             .output()
             .map_err(RunError::Io)
-    }
-}
-
-impl NotifySendNotifier {
-    fn from_env() -> Self {
-        Self {
-            command_path: env::var_os("LG_BUDDY_NOTIFY_SEND")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("notify-send")),
-        }
     }
 }
 
@@ -229,17 +206,6 @@ impl BrightnessUi for ZenityBrightnessUi {
             .arg("--error")
             .arg(format!("--title={title}"))
             .arg(format!("--text={message}"))
-            .output()?;
-
-        Ok(())
-    }
-}
-
-impl Notifier for NotifySendNotifier {
-    fn notify(&self, title: &str, message: &str) -> io::Result<()> {
-        let _ = ProcessCommand::new(&self.command_path)
-            .arg(title)
-            .arg(message)
             .output()?;
 
         Ok(())
@@ -338,7 +304,7 @@ pub fn run_brightness<W: Write>(
             let reachability = PingReachabilityChecker::default();
             let ui = ZenityBrightnessUi::default();
             let brightness_cli = CurrentExeBrightnessCli::from_current_exe()?;
-            let notifier = NotifySendNotifier::default();
+            let notifier = FreedesktopNotifier;
             let deps = BrightnessDialogDeps {
                 reachability: &reachability,
                 ui: &ui,
@@ -510,17 +476,42 @@ fn run_brightness_prompt_with<
 
     match deps.brightness_cli.set_brightness(brightness) {
         Ok(stdout) => {
-            let _ = deps
-                .notifier
-                .notify("LG TV", &format!("Brightness set to {brightness}%"));
             write!(writer, "{stdout}")?;
+            notify_brightness_success(deps.notifier, brightness)?;
             Ok(())
         }
-        Err(err) => {
-            let _ = deps.notifier.notify("LG TV", "Failed to set brightness");
-            Err(err)
-        }
+        Err(err) => Err(notify_brightness_failure(deps.notifier, err)),
     }
+}
+
+fn notify_brightness_success<N: Notifier>(
+    notifier: &N,
+    brightness: OledBrightness,
+) -> Result<(), RunError> {
+    notifier
+        .notify(&Notification::new(
+            "LG TV",
+            format!("Brightness set to {brightness}%"),
+        ))
+        .map(|_| ())
+        .map_err(|err| {
+            RunError::Policy(format!(
+                "brightness was set to {brightness}%, but desktop notification failed: {err}"
+            ))
+        })
+}
+
+fn notify_brightness_failure<N: Notifier>(notifier: &N, primary: RunError) -> RunError {
+    match notifier.notify(&Notification::new("LG TV", "Failed to set brightness")) {
+        Ok(_) => primary,
+        Err(notification_err) => append_notification_failure(primary, notification_err),
+    }
+}
+
+fn append_notification_failure(primary: RunError, notification_err: NotificationError) -> RunError {
+    RunError::Policy(format!(
+        "{primary}; additionally, desktop notification failed: {notification_err}"
+    ))
 }
 
 fn read_oled_brightness<C: TvClient>(
@@ -553,7 +544,7 @@ mod tests {
 
     use super::{
         run_brightness_command_with, run_brightness_prompt_with, BrightnessCli,
-        BrightnessDialogDeps, BrightnessUi, Notifier, ReachabilityChecker,
+        BrightnessDialogDeps, BrightnessUi, ReachabilityChecker,
     };
     use crate::config::{
         Config, HdmiInput, MacAddress, ScreenBackend, ScreenRestorePolicy, SystemSleepWakePolicy,
@@ -562,6 +553,7 @@ mod tests {
         run_shutdown_with, run_startup_with, NetworkWaiter, RebootDetector, SleepRequestDetector,
         Sleeper, StartupDeps,
     };
+    use crate::notifications::{Notification, NotificationError, NotificationId, Notifier};
     use crate::screen::{run_screen_off_with, run_screen_on_with};
     use crate::state::ScreenOwnershipMarker;
     use crate::state::SystemSleepAttemptState;
@@ -1324,6 +1316,38 @@ mod tests {
     }
 
     #[test]
+    fn brightness_fails_after_success_when_notification_delivery_fails() {
+        let reachability = FakeReachabilityChecker::reachable();
+        let ui = FakeBrightnessUi::selected(65);
+        let brightness_cli = FakeBrightnessCli::success(72)
+            .with_set_stdout("LG Buddy Brightness: Set OLED pixel brightness to 65%.\n");
+        let notifier = RecordingNotifier::failing("bus unavailable");
+        let deps = BrightnessDialogDeps {
+            reachability: &reachability,
+            ui: &ui,
+            brightness_cli: &brightness_cli,
+            notifier: &notifier,
+        };
+
+        let mut output = Vec::new();
+        let err = run_brightness_prompt_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
+            .expect_err("notification failure after success should fail");
+
+        assert_eq!(
+            notifier.messages(),
+            vec![("LG TV".to_string(), "Brightness set to 65%".to_string())]
+        );
+        assert_eq!(
+            brightness_cli.calls(),
+            vec![FakeBrightnessCliCall::Get, FakeBrightnessCliCall::Set(65),]
+        );
+        assert!(rendered(&output).contains("Set OLED pixel brightness to 65%."));
+        assert!(err
+            .to_string()
+            .contains("brightness was set to 65%, but desktop notification failed"));
+    }
+
+    #[test]
     fn brightness_get_prints_current_oled_brightness() {
         let mock = MockBscpylgtv::new("brightness-get-tv");
         mock.set_backlight(72);
@@ -1461,6 +1485,34 @@ mod tests {
         assert_eq!(
             brightness_cli.calls(),
             vec![FakeBrightnessCliCall::Get, FakeBrightnessCliCall::Set(30),]
+        );
+        assert!(rendered(&output).is_empty());
+    }
+
+    #[test]
+    fn brightness_preserves_tv_failure_when_failure_notification_fails() {
+        let reachability = FakeReachabilityChecker::reachable();
+        let ui = FakeBrightnessUi::selected(30);
+        let brightness_cli = FakeBrightnessCli::success(50).with_set_error("offline");
+        let notifier = RecordingNotifier::failing("bus unavailable");
+        let deps = BrightnessDialogDeps {
+            reachability: &reachability,
+            ui: &ui,
+            brightness_cli: &brightness_cli,
+            notifier: &notifier,
+        };
+
+        let mut output = Vec::new();
+        let err = run_brightness_prompt_with(&mut output, &sample_config(HdmiInput::Hdmi2), deps)
+            .expect_err("tv and notification failure should fail");
+
+        assert_eq!(
+            notifier.messages(),
+            vec![("LG TV".to_string(), "Failed to set brightness".to_string())]
+        );
+        assert_eq!(
+            err.to_string(),
+            "offline; additionally, desktop notification failed: desktop notification service error: bus unavailable"
         );
         assert!(rendered(&output).is_empty());
     }
@@ -1979,23 +2031,45 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct RecordingNotifier {
         messages: RefCell<Vec<(String, String)>>,
+        result: Result<NotificationId, NotificationError>,
     }
 
     impl RecordingNotifier {
+        fn failing(message: &str) -> Self {
+            Self {
+                messages: RefCell::new(Vec::new()),
+                result: Err(NotificationError::Transport(message.to_string())),
+            }
+        }
+
         fn messages(&self) -> Vec<(String, String)> {
             self.messages.borrow().clone()
         }
     }
 
+    impl Default for RecordingNotifier {
+        fn default() -> Self {
+            Self {
+                messages: RefCell::new(Vec::new()),
+                result: Ok(NotificationId(1)),
+            }
+        }
+    }
+
     impl Notifier for RecordingNotifier {
-        fn notify(&self, title: &str, message: &str) -> io::Result<()> {
+        fn capabilities(
+            &self,
+        ) -> Result<crate::notifications::NotificationCapabilities, NotificationError> {
+            Ok(crate::notifications::NotificationCapabilities { actions: true })
+        }
+
+        fn notify(&self, notification: &Notification) -> Result<NotificationId, NotificationError> {
             self.messages
                 .borrow_mut()
-                .push((title.to_string(), message.to_string()));
-            Ok(())
+                .push((notification.summary.clone(), notification.body.clone()));
+            self.result.clone()
         }
     }
 
