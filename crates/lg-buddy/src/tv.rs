@@ -809,11 +809,9 @@ fn parse_backlight(output: &str) -> Option<OledBrightness> {
             .trim()
             .trim_matches('\'')
             .trim_matches('"')
-            .parse::<u16>()
+            .parse::<u8>()
             .ok()?;
-        if parsed <= 100 {
-            return Some(OledBrightness(parsed as u8));
-        }
+        return OledBrightness::new(parsed).ok();
     }
 
     None
