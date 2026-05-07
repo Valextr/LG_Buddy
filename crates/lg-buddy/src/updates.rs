@@ -618,6 +618,31 @@ mod tests {
     }
 
     #[test]
+    fn stable_channel_uses_github_latest_endpoint_for_stable_only_ordering() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.2.0"))]);
+
+        let result = check_updates(
+            UpdatesCommand::Check {
+                channel: Some(UpdateChannel::Stable),
+            },
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+        )
+        .expect("stable update check should succeed");
+
+        assert!(result.update_available());
+        assert_eq!(result.latest.version().to_string(), "1.2.0");
+        assert_eq!(result.latest.channel(), UpdateChannel::Stable);
+        assert_eq!(
+            client.requests(),
+            vec![(
+                "https://api.example.test/releases/latest".to_string(),
+                "lg-buddy/1.1.0".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn prerelease_channel_includes_stable_releases_and_picks_highest_semver() {
         let client = MockGitHubReleasesClient::new(vec![Ok(format!(
             "[{},{},{},{}]",
@@ -640,6 +665,35 @@ mod tests {
         assert_eq!(
             result.render(),
             "status: update available\ncurrent: 1.2.0-beta.1 (prerelease)\nlatest: 1.2.0 (stable)\nurl: https://github.test/releases/tag/v1.2.0\n"
+        );
+    }
+
+    #[test]
+    fn prerelease_channel_uses_semver_ordering_across_release_stages() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(format!(
+            "[{},{},{},{},{}]",
+            stable_release("v1.2.0"),
+            prerelease("v1.2.0-rc.1"),
+            prerelease("v1.3.0-alpha.1"),
+            prerelease("v1.2.0-beta.1"),
+            prerelease("v1.2.0-alpha.1")
+        ))]);
+
+        let result = check_updates(
+            UpdatesCommand::Check {
+                channel: Some(UpdateChannel::Prerelease),
+            },
+            version_info("1.2.0-beta.1", ReleaseChannel::Prerelease),
+            &client,
+        )
+        .expect("prerelease update check should succeed");
+
+        assert!(result.update_available());
+        assert_eq!(result.latest.version().to_string(), "1.3.0-alpha.1");
+        assert_eq!(result.latest.channel(), UpdateChannel::Prerelease);
+        assert_eq!(
+            result.latest.url(),
+            "https://github.test/releases/tag/v1.3.0-alpha.1"
         );
     }
 
