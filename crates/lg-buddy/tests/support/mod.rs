@@ -1,4 +1,4 @@
-use dbus::arg::Variant as DbusVariant;
+use dbus::arg::{PropMap, Variant as DbusVariant};
 use dbus::blocking::Connection as DbusConnection;
 use dbus::channel::{MatchingReceiver, Sender as DbusSender};
 use dbus::Message as DbusMessage;
@@ -350,6 +350,7 @@ struct MockSessionBusIdleMonitorState {
     shell_available: bool,
     screen_saver_available: bool,
     idle_monitor_available: bool,
+    notifications_available: bool,
     default_idletime: u64,
     idletime_plan: VecDeque<u64>,
     screen_saver_signals: VecDeque<MockScreenSaverSignal>,
@@ -414,6 +415,13 @@ impl MockSessionBusIdleMonitor {
             if !value {
                 state.client_ready = false;
             }
+        });
+        wait_for_mock_bus_name_sync();
+    }
+
+    pub fn set_notifications_available(&self, value: bool) {
+        self.patch_state(|state| {
+            state.notifications_available = value;
         });
         wait_for_mock_bus_name_sync();
     }
@@ -649,7 +657,50 @@ fn spawn_mock_idle_monitor_service(
                 Ok((value,))
             });
         });
+        let notifications_iface =
+            crossroads.register("org.freedesktop.Notifications", move |builder| {
+                builder.method("GetCapabilities", (), ("capabilities",), move |_, _, ()| {
+                    Ok((vec!["actions".to_string()],))
+                });
+
+                builder.method(
+                    "Notify",
+                    (
+                        "app_name",
+                        "replaces_id",
+                        "app_icon",
+                        "summary",
+                        "body",
+                        "actions",
+                        "hints",
+                        "expire_timeout",
+                    ),
+                    ("id",),
+                    move |_,
+                          _,
+                          (
+                        _app_name,
+                        _replaces_id,
+                        _app_icon,
+                        _summary,
+                        _body,
+                        _actions,
+                        _hints,
+                        _expire_timeout,
+                    ): (
+                        String,
+                        u32,
+                        String,
+                        String,
+                        String,
+                        Vec<String>,
+                        PropMap,
+                        i32,
+                    )| { Ok((1_u32,)) },
+                );
+            });
         crossroads.insert("/org/gnome/Mutter/IdleMonitor/Core", &[iface], ());
+        crossroads.insert("/org/freedesktop/Notifications", &[notifications_iface], ());
 
         let shared_crossroads = Arc::new(Mutex::new(crossroads));
         let crossroads_receiver = Arc::clone(&shared_crossroads);
@@ -766,6 +817,7 @@ struct MockOwnedBusNames {
     shell: bool,
     screen_saver: bool,
     idle_monitor: bool,
+    notifications: bool,
 }
 
 fn sync_mock_bus_names(
@@ -773,7 +825,7 @@ fn sync_mock_bus_names(
     state: &Arc<Mutex<MockSessionBusIdleMonitorState>>,
     owned_names: &mut MockOwnedBusNames,
 ) {
-    let (want_shell, want_screen_saver, want_idle_monitor) = {
+    let (want_shell, want_screen_saver, want_idle_monitor, want_notifications) = {
         let state = state
             .lock()
             .expect("mock session-bus idle monitor state lock");
@@ -781,6 +833,7 @@ fn sync_mock_bus_names(
             state.shell_available,
             state.screen_saver_available,
             state.idle_monitor_available,
+            state.notifications_available,
         )
     };
 
@@ -801,6 +854,12 @@ fn sync_mock_bus_names(
         "org.gnome.Mutter.IdleMonitor",
         want_idle_monitor,
         &mut owned_names.idle_monitor,
+    );
+    sync_mock_bus_name(
+        connection,
+        "org.freedesktop.Notifications",
+        want_notifications,
+        &mut owned_names.notifications,
     );
 }
 

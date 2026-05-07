@@ -6,6 +6,7 @@ use std::time::Duration;
 use semver::Version;
 use serde::Deserialize;
 
+use crate::notifications::{FreedesktopNotifier, Notification, NotificationError, Notifier};
 use crate::version::{ReleaseChannel, VersionInfo};
 
 const GITHUB_RELEASES_API_BASE: &str =
@@ -18,7 +19,10 @@ const PRERELEASE_PAGE_SIZE: u8 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdatesCommand {
-    Check { channel: Option<UpdateChannel> },
+    Check {
+        channel: Option<UpdateChannel>,
+        notify: bool,
+    },
 }
 
 impl UpdatesCommand {
@@ -43,6 +47,12 @@ impl UpdatesCommand {
             Self::Check { .. } => "check",
         }
     }
+
+    fn notify(&self) -> bool {
+        match self {
+            Self::Check { notify, .. } => *notify,
+        }
+    }
 }
 
 fn parse_check_args<I, S>(args: I) -> Result<UpdatesCommand, UpdatesParseError>
@@ -52,6 +62,7 @@ where
 {
     let mut args = args.into_iter();
     let mut channel = None;
+    let mut notify = false;
 
     while let Some(arg) = args.next() {
         match arg.as_ref() {
@@ -62,6 +73,13 @@ where
 
                 let value = args.next().ok_or(UpdatesParseError::MissingChannelValue)?;
                 channel = Some(UpdateChannel::parse(value.as_ref())?);
+            }
+            "--notify" => {
+                if notify {
+                    return Err(UpdatesParseError::DuplicateNotify);
+                }
+
+                notify = true;
             }
             other => {
                 let mut unexpected = vec![other.to_string()];
@@ -74,7 +92,7 @@ where
         }
     }
 
-    Ok(UpdatesCommand::Check { channel })
+    Ok(UpdatesCommand::Check { channel, notify })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +101,7 @@ pub enum UpdatesParseError {
     UnknownSubcommand(String),
     MissingChannelValue,
     DuplicateChannel,
+    DuplicateNotify,
     UnknownChannel(String),
     UnexpectedArguments {
         subcommand: &'static str,
@@ -95,13 +114,14 @@ impl fmt::Display for UpdatesParseError {
         match self {
             Self::MissingSubcommand => write!(
                 f,
-                "missing updates command; expected `updates check [--channel stable|prerelease]`"
+                "missing updates command; expected `updates check [--channel stable|prerelease] [--notify]`"
             ),
             Self::UnknownSubcommand(subcommand) => {
                 write!(f, "unknown updates command `{subcommand}`")
             }
             Self::MissingChannelValue => write!(f, "missing channel value for `updates check`"),
             Self::DuplicateChannel => write!(f, "duplicate `--channel` option"),
+            Self::DuplicateNotify => write!(f, "duplicate `--notify` option"),
             Self::UnknownChannel(channel) => write!(
                 f,
                 "unknown updates channel `{channel}`; expected stable or prerelease"
@@ -172,6 +192,7 @@ pub enum UpdatesError {
     NoMatchingRelease {
         channel: UpdateChannel,
     },
+    Notification(NotificationError),
     Io(io::Error),
 }
 
@@ -211,6 +232,7 @@ impl fmt::Display for UpdatesError {
                     channel.as_str()
                 )
             }
+            Self::Notification(err) => write!(f, "could not send update notification: {err}"),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -221,6 +243,7 @@ impl Error for UpdatesError {
         match self {
             Self::ApiShape { source, .. } => Some(source),
             Self::InvalidLocalVersion { source, .. } => Some(source),
+            Self::Notification(err) => Some(err),
             Self::Io(err) => Some(err),
             Self::Http { .. } | Self::ApiStatus { .. } | Self::NoMatchingRelease { .. } => None,
         }
@@ -280,6 +303,20 @@ impl UpdateCheckResult {
             self.latest.version(),
             self.latest.channel().as_str(),
             self.latest.url()
+        )
+    }
+
+    fn notification(&self) -> Notification {
+        Notification::new(
+            "LG Buddy update available",
+            format!(
+                "LG Buddy {} ({}) is available.\nCurrent: {} ({})\n{}",
+                self.latest.version(),
+                self.latest.channel().as_str(),
+                self.current_version,
+                self.current_channel.as_str(),
+                self.latest.url()
+            ),
         )
     }
 }
@@ -369,9 +406,28 @@ pub fn run_updates_command<W: io::Write>(
 ) -> Result<(), UpdatesError> {
     let client = UreqGitHubReleasesClient::default();
     let version = VersionInfo::current();
-    let result = check_updates(command, version, &client)?;
+    let notifier = FreedesktopNotifier;
+
+    run_updates_command_with(command, writer, version, &client, &notifier)
+}
+
+fn run_updates_command_with<W: io::Write, C: GitHubReleasesClient, N: Notifier>(
+    command: UpdatesCommand,
+    writer: &mut W,
+    version: VersionInfo,
+    client: &C,
+    notifier: &N,
+) -> Result<(), UpdatesError> {
+    let notify = command.notify();
+    let result = check_updates(command, version, client)?;
 
     writer.write_all(result.render().as_bytes())?;
+    if notify && result.update_available() {
+        notifier
+            .notify(&result.notification())
+            .map_err(UpdatesError::Notification)?;
+    }
+
     Ok(())
 }
 
@@ -381,7 +437,7 @@ fn check_updates<C: GitHubReleasesClient>(
     client: &C,
 ) -> Result<UpdateCheckResult, UpdatesError> {
     match command {
-        UpdatesCommand::Check { channel } => {
+        UpdatesCommand::Check { channel, .. } => {
             let channel = channel.unwrap_or_else(|| UpdateChannel::default_for(current));
             let current_version = Version::parse(current.version()).map_err(|source| {
                 UpdatesError::InvalidLocalVersion {
@@ -473,8 +529,11 @@ fn parse_release_version(tag_name: &str) -> Option<Version> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_updates, parse_release_version, GitHubReleasesClient, ReleaseEndpoint, UpdateChannel,
-        UpdatesCommand, UpdatesError,
+        check_updates, parse_release_version, run_updates_command_with, GitHubReleasesClient,
+        ReleaseEndpoint, UpdateChannel, UpdatesCommand, UpdatesError,
+    };
+    use crate::notifications::{
+        Notification, NotificationCapabilities, NotificationError, NotificationId, Notifier,
     };
     use crate::version::{ReleaseChannel, VersionInfo};
     use std::cell::RefCell;
@@ -508,6 +567,44 @@ mod tests {
         }
     }
 
+    struct RecordingNotifier {
+        notifications: RefCell<Vec<Notification>>,
+        result: Result<NotificationId, NotificationError>,
+    }
+
+    impl RecordingNotifier {
+        fn failing(message: &str) -> Self {
+            Self {
+                notifications: RefCell::new(Vec::new()),
+                result: Err(NotificationError::Transport(message.to_string())),
+            }
+        }
+
+        fn notifications(&self) -> Vec<Notification> {
+            self.notifications.borrow().clone()
+        }
+    }
+
+    impl Default for RecordingNotifier {
+        fn default() -> Self {
+            Self {
+                notifications: RefCell::new(Vec::new()),
+                result: Ok(NotificationId(1)),
+            }
+        }
+    }
+
+    impl Notifier for RecordingNotifier {
+        fn capabilities(&self) -> Result<NotificationCapabilities, NotificationError> {
+            Ok(NotificationCapabilities { actions: true })
+        }
+
+        fn notify(&self, notification: &Notification) -> Result<NotificationId, NotificationError> {
+            self.notifications.borrow_mut().push(notification.clone());
+            self.result.clone()
+        }
+    }
+
     fn version_info(version: &'static str, channel: ReleaseChannel) -> VersionInfo {
         VersionInfo::for_testing(version, channel, Some("test"))
     }
@@ -530,12 +627,30 @@ mod tests {
         )
     }
 
+    fn rendered(output: &[u8]) -> String {
+        String::from_utf8(output.to_vec()).expect("utf8 output")
+    }
+
+    fn check(channel: Option<UpdateChannel>) -> UpdatesCommand {
+        UpdatesCommand::Check {
+            channel,
+            notify: false,
+        }
+    }
+
+    fn check_notify(channel: Option<UpdateChannel>) -> UpdatesCommand {
+        UpdatesCommand::Check {
+            channel,
+            notify: true,
+        }
+    }
+
     #[test]
     fn updates_check_uses_stable_channel_for_stable_builds_by_default() {
         let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.1"))]);
 
         let result = check_updates(
-            UpdatesCommand::Check { channel: None },
+            check(None),
             version_info("1.1.0", ReleaseChannel::Stable),
             &client,
         )
@@ -564,7 +679,7 @@ mod tests {
         ))]);
 
         let result = check_updates(
-            UpdatesCommand::Check { channel: None },
+            check(None),
             version_info("1.1.0-beta.1", ReleaseChannel::Prerelease),
             &client,
         )
@@ -586,7 +701,7 @@ mod tests {
         let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.0"))]);
 
         let result = check_updates(
-            UpdatesCommand::Check { channel: None },
+            check(None),
             version_info("1.1.0", ReleaseChannel::Dev),
             &client,
         )
@@ -600,14 +715,123 @@ mod tests {
     }
 
     #[test]
+    fn plain_updates_check_does_not_send_notification() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.1"))]);
+        let notifier = RecordingNotifier::default();
+        let mut output = Vec::new();
+
+        run_updates_command_with(
+            check(None),
+            &mut output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+        )
+        .expect("plain update check should succeed");
+
+        assert!(rendered(&output).contains("status: update available"));
+        assert!(notifier.notifications().is_empty());
+    }
+
+    #[test]
+    fn notify_sends_notification_when_update_is_available() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.1"))]);
+        let notifier = RecordingNotifier::default();
+        let mut output = Vec::new();
+
+        run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+        )
+        .expect("notifying update check should succeed");
+
+        assert!(rendered(&output).contains("status: update available"));
+        let notifications = notifier.notifications();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].summary, "LG Buddy update available");
+        assert_eq!(
+            notifications[0].body,
+            "LG Buddy 1.1.1 (stable) is available.\nCurrent: 1.1.0 (stable)\nhttps://github.test/releases/tag/v1.1.1"
+        );
+    }
+
+    #[test]
+    fn notify_does_not_send_notification_when_up_to_date() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.0"))]);
+        let notifier = RecordingNotifier::default();
+        let mut output = Vec::new();
+
+        run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+        )
+        .expect("notifying update check should succeed");
+
+        assert!(rendered(&output).contains("status: up to date"));
+        assert!(notifier.notifications().is_empty());
+    }
+
+    #[test]
+    fn notify_failure_after_available_update_returns_error_after_rendering_output() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.1"))]);
+        let notifier = RecordingNotifier::failing("bus unavailable");
+        let mut output = Vec::new();
+
+        let err = run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+        )
+        .expect_err("notification failure should fail notifying update check");
+
+        assert!(matches!(err, UpdatesError::Notification(_)));
+        assert!(rendered(&output).contains("status: update available"));
+        assert_eq!(notifier.notifications().len(), 1);
+        assert_eq!(
+            err.to_string(),
+            "could not send update notification: desktop notification service error: bus unavailable"
+        );
+    }
+
+    #[test]
+    fn notify_does_not_send_notification_when_update_check_fails() {
+        let client = MockGitHubReleasesClient::new(vec![Err(UpdatesError::ApiStatus {
+            url: "https://api.example.test/releases/latest".to_string(),
+            status: 500,
+            body: "server error".to_string(),
+        })]);
+        let notifier = RecordingNotifier::default();
+        let mut output = Vec::new();
+
+        let err = run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+        )
+        .expect_err("API failure should fail before notification");
+
+        assert!(matches!(err, UpdatesError::ApiStatus { .. }));
+        assert!(rendered(&output).is_empty());
+        assert!(notifier.notifications().is_empty());
+    }
+
+    #[test]
     fn explicit_stable_channel_reports_up_to_date_for_equal_or_older_versions() {
         for tag in ["v1.1.0", "v1.0.9"] {
             let client = MockGitHubReleasesClient::new(vec![Ok(stable_release(tag))]);
 
             let result = check_updates(
-                UpdatesCommand::Check {
-                    channel: Some(UpdateChannel::Stable),
-                },
+                check(Some(UpdateChannel::Stable)),
                 version_info("1.1.0", ReleaseChannel::Stable),
                 &client,
             )
@@ -622,9 +846,7 @@ mod tests {
         let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.2.0"))]);
 
         let result = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Stable),
-            },
+            check(Some(UpdateChannel::Stable)),
             version_info("1.1.0", ReleaseChannel::Stable),
             &client,
         )
@@ -653,9 +875,7 @@ mod tests {
         ))]);
 
         let result = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Prerelease),
-            },
+            check(Some(UpdateChannel::Prerelease)),
             version_info("1.2.0-beta.1", ReleaseChannel::Prerelease),
             &client,
         )
@@ -680,9 +900,7 @@ mod tests {
         ))]);
 
         let result = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Prerelease),
-            },
+            check(Some(UpdateChannel::Prerelease)),
             version_info("1.2.0-beta.1", ReleaseChannel::Prerelease),
             &client,
         )
@@ -702,9 +920,7 @@ mod tests {
         let client = MockGitHubReleasesClient::new(vec![Ok(prerelease("v1.1.1-beta.1"))]);
 
         let err = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Stable),
-            },
+            check(Some(UpdateChannel::Stable)),
             version_info("1.1.0", ReleaseChannel::Stable),
             &client,
         )
@@ -727,9 +943,7 @@ mod tests {
         })]);
 
         let err = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Stable),
-            },
+            check(Some(UpdateChannel::Stable)),
             version_info("1.1.0", ReleaseChannel::Stable),
             &client,
         )
@@ -746,9 +960,7 @@ mod tests {
         let client = MockGitHubReleasesClient::new(vec![Ok("{".to_string())]);
 
         let err = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Stable),
-            },
+            check(Some(UpdateChannel::Stable)),
             version_info("1.1.0", ReleaseChannel::Stable),
             &client,
         )
@@ -770,9 +982,7 @@ mod tests {
         )]);
 
         let err = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Stable),
-            },
+            check(Some(UpdateChannel::Stable)),
             version_info("1.1.0", ReleaseChannel::Stable),
             &client,
         )
@@ -796,9 +1006,7 @@ mod tests {
         ))]);
 
         let err = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Prerelease),
-            },
+            check(Some(UpdateChannel::Prerelease)),
             version_info("1.1.0-beta.1", ReleaseChannel::Prerelease),
             &client,
         )
@@ -817,9 +1025,7 @@ mod tests {
         let client = MockGitHubReleasesClient::new(vec![]);
 
         let err = check_updates(
-            UpdatesCommand::Check {
-                channel: Some(UpdateChannel::Stable),
-            },
+            check(Some(UpdateChannel::Stable)),
             version_info("not-semver", ReleaseChannel::Dev),
             &client,
         )

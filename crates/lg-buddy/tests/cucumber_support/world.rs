@@ -289,6 +289,8 @@ exit 1\n",
     }
 
     pub fn install_brightness_ui_stub(&mut self, selection: Option<u8>) {
+        self.ensure_mock_session_bus_idle_monitor()
+            .set_notifications_available(true);
         let body = match selection {
             Some(value) => format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--scale\" ]; then\n  printf '%s\\n' '{value}'\n  exit 0\nfi\nif [ \"$1\" = \"--error\" ]; then\n  exit 0\nfi\nexit 1\n"
