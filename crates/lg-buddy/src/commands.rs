@@ -509,9 +509,10 @@ fn notify_brightness_failure<N: Notifier>(notifier: &N, primary: RunError) -> Ru
 }
 
 fn append_notification_failure(primary: RunError, notification_err: NotificationError) -> RunError {
-    RunError::Policy(format!(
-        "{primary}; additionally, desktop notification failed: {notification_err}"
-    ))
+    RunError::NotificationAfterPrimary {
+        primary: Box::new(primary),
+        notification: notification_err,
+    }
 }
 
 fn read_oled_brightness<C: TvClient>(

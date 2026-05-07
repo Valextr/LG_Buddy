@@ -31,6 +31,7 @@ use crate::commands::{
     run_sleep_pre,
 };
 use crate::config::{ConfigError, ConfigPathError};
+use crate::notifications::NotificationError;
 use crate::session::runner::{run_lifecycle_monitor, run_monitor};
 use crate::settings::{run_settings_command, SettingsCommand, SettingsError, SettingsParseError};
 use crate::state::StateDirError;
@@ -153,6 +154,10 @@ pub enum RunError {
     BackendDetection(BackendDetectionError),
     Settings(SettingsError),
     Updates(UpdatesError),
+    NotificationAfterPrimary {
+        primary: Box<RunError>,
+        notification: NotificationError,
+    },
 }
 
 impl fmt::Display for RunError {
@@ -168,6 +173,13 @@ impl fmt::Display for RunError {
             Self::BackendDetection(err) => write!(f, "{err}"),
             Self::Settings(err) => write!(f, "{err}"),
             Self::Updates(err) => write!(f, "{err}"),
+            Self::NotificationAfterPrimary {
+                primary,
+                notification,
+            } => write!(
+                f,
+                "{primary}; additionally, desktop notification failed: {notification}"
+            ),
         }
     }
 }
@@ -185,6 +197,7 @@ impl std::error::Error for RunError {
             Self::BackendDetection(err) => Some(err),
             Self::Settings(err) => Some(err),
             Self::Updates(err) => Some(err),
+            Self::NotificationAfterPrimary { primary, .. } => Some(primary.as_ref()),
         }
     }
 }
@@ -435,6 +448,9 @@ mod tests {
     use crate::settings::{SettingsCommand, SettingsParseError};
     use crate::tv::OledBrightness;
     use crate::updates::{UpdateChannel, UpdatesCommand, UpdatesParseError};
+    use crate::{notifications::NotificationError, RunError};
+    use std::error::Error;
+    use std::io;
 
     #[test]
     fn no_args_prints_help() {
@@ -786,6 +802,25 @@ mod tests {
             assert!(help.contains(command), "missing `{command}` from help");
         }
         assert!(!help.contains("Reserved for write support"));
+    }
+
+    #[test]
+    fn notification_context_preserves_primary_run_error_source() {
+        let err = RunError::NotificationAfterPrimary {
+            primary: Box::new(RunError::Io(io::Error::other("disk unavailable"))),
+            notification: NotificationError::Transport("bus unavailable".to_string()),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "disk unavailable; additionally, desktop notification failed: desktop notification service error: bus unavailable"
+        );
+        assert_eq!(
+            err.source()
+                .expect("primary source should be preserved")
+                .to_string(),
+            "disk unavailable"
+        );
     }
 
     fn brightness(value: u8) -> OledBrightness {
