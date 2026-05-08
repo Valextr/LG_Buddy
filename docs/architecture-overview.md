@@ -335,7 +335,8 @@ an update is available, the one-shot CLI process hands the resolved update facts
 to the LG Buddy-owned user-session D-Bus surface. The running session process
 then owns desktop notification dispatch, notification ids, and the `View
 Release` action. `updates check` owns an operational cache under the user cache
-directory for GitHub ETag and latest release metadata; that cache is not user
+directory for GitHub ETag, latest release metadata, and last-notified release
+state used by the observable update notification policy; that cache is not user
 configuration and is not part of the settings API.
 The `brightness get` and `brightness set` commands use the TV picture
 abstraction in `tv.rs` for typed OLED brightness validation and live TV
