@@ -13,6 +13,7 @@ use crate::session_notifications::{
     SessionBusUpdateNotificationHandoff, UpdateNotificationError, UpdateNotificationHandoff,
     UpdateNotificationRequest,
 };
+use crate::settings::{SettingsError, SettingsStore};
 use crate::version::{ReleaseChannel, VersionInfo};
 
 const GITHUB_RELEASES_API_BASE: &str =
@@ -31,6 +32,7 @@ pub enum UpdatesCommand {
         channel: Option<UpdateChannel>,
         notify: bool,
     },
+    BackgroundCheck,
 }
 
 impl UpdatesCommand {
@@ -46,6 +48,7 @@ impl UpdatesCommand {
 
         match subcommand.as_ref() {
             "check" => parse_check_args(args),
+            "background-check" => parse_background_check_args(args),
             other => Err(UpdatesParseError::UnknownSubcommand(other.to_string())),
         }
     }
@@ -53,13 +56,34 @@ impl UpdatesCommand {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Check { .. } => "check",
+            Self::BackgroundCheck => "background-check",
         }
     }
 
     fn notify(&self) -> bool {
         match self {
             Self::Check { notify, .. } => *notify,
+            Self::BackgroundCheck => true,
         }
+    }
+}
+
+fn parse_background_check_args<I, S>(args: I) -> Result<UpdatesCommand, UpdatesParseError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let extra_args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .collect();
+    if extra_args.is_empty() {
+        Ok(UpdatesCommand::BackgroundCheck)
+    } else {
+        Err(UpdatesParseError::UnexpectedArguments {
+            subcommand: "background-check",
+            arguments: extra_args,
+        })
     }
 }
 
@@ -122,7 +146,7 @@ impl fmt::Display for UpdatesParseError {
         match self {
             Self::MissingSubcommand => write!(
                 f,
-                "missing updates command; expected `updates check [--channel stable|prerelease] [--notify]`"
+                "missing updates command; expected `updates check [--channel stable|prerelease] [--notify]` or `updates background-check`"
             ),
             Self::UnknownSubcommand(subcommand) => {
                 write!(f, "unknown updates command `{subcommand}`")
@@ -176,6 +200,101 @@ impl UpdateChannel {
             ReleaseChannel::Prerelease => Self::Prerelease,
             ReleaseChannel::Dev | ReleaseChannel::Stable => Self::Stable,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundUpdateAutoCheck {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundUpdateChannel {
+    Auto,
+    Stable,
+    Prerelease,
+}
+
+impl BackgroundUpdateChannel {
+    fn check_channel(self) -> Option<UpdateChannel> {
+        match self {
+            Self::Auto => None,
+            Self::Stable => Some(UpdateChannel::Stable),
+            Self::Prerelease => Some(UpdateChannel::Prerelease),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundUpdateCheckPolicy {
+    auto_check: BackgroundUpdateAutoCheck,
+    channel: BackgroundUpdateChannel,
+}
+
+impl BackgroundUpdateCheckPolicy {
+    fn from_settings(store: &SettingsStore) -> Result<Self, UpdatesError> {
+        let auto_check = match required_enum_setting(store, "updates.auto_check")? {
+            "enabled" => BackgroundUpdateAutoCheck::Enabled,
+            "disabled" => BackgroundUpdateAutoCheck::Disabled,
+            _ => {
+                return Err(UpdatesError::SettingsInvariant(
+                    "updates.auto_check resolved to an unsupported value".to_string(),
+                ));
+            }
+        };
+        let channel = match required_enum_setting(store, "updates.channel")? {
+            "auto" => BackgroundUpdateChannel::Auto,
+            "stable" => BackgroundUpdateChannel::Stable,
+            "prerelease" => BackgroundUpdateChannel::Prerelease,
+            _ => {
+                return Err(UpdatesError::SettingsInvariant(
+                    "updates.channel resolved to an unsupported value".to_string(),
+                ));
+            }
+        };
+
+        Ok(Self {
+            auto_check,
+            channel,
+        })
+    }
+
+    fn check_command(self) -> Option<UpdatesCommand> {
+        match self.auto_check {
+            BackgroundUpdateAutoCheck::Disabled => None,
+            BackgroundUpdateAutoCheck::Enabled => Some(UpdatesCommand::Check {
+                channel: self.channel.check_channel(),
+                notify: true,
+            }),
+        }
+    }
+}
+
+fn required_enum_setting(
+    store: &SettingsStore,
+    key: &'static str,
+) -> Result<&'static str, UpdatesError> {
+    store
+        .effective_by_name(key)?
+        .required_value()?
+        .as_enum()
+        .ok_or_else(|| {
+            UpdatesError::SettingsInvariant(format!("{key} resolved to a non-enum value"))
+        })
+}
+
+trait BackgroundUpdateSettings {
+    fn background_update_check_policy(&self) -> Result<BackgroundUpdateCheckPolicy, UpdatesError>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnvBackgroundUpdateSettings;
+
+impl BackgroundUpdateSettings for EnvBackgroundUpdateSettings {
+    fn background_update_check_policy(&self) -> Result<BackgroundUpdateCheckPolicy, UpdatesError> {
+        let store = SettingsStore::load_from_env()?;
+        BackgroundUpdateCheckPolicy::from_settings(&store)
     }
 }
 
@@ -267,6 +386,8 @@ pub enum UpdatesError {
         source: serde_json::Error,
     },
     CacheEncode(serde_json::Error),
+    Settings(SettingsError),
+    SettingsInvariant(String),
     DeferredFailures(Vec<UpdatesDeferredFailure>),
     Notification(UpdateNotificationError),
     Io(io::Error),
@@ -348,6 +469,10 @@ impl fmt::Display for UpdatesError {
                 )
             }
             Self::CacheEncode(err) => write!(f, "could not encode update check cache: {err}"),
+            Self::Settings(err) => write!(f, "could not read update settings: {err}"),
+            Self::SettingsInvariant(message) => {
+                write!(f, "invalid update settings metadata: {message}")
+            }
             Self::DeferredFailures(failures) => {
                 write!(f, "update check completed with deferred failure")?;
                 if failures.len() != 1 {
@@ -378,6 +503,7 @@ impl Error for UpdatesError {
             Self::CachePath(err) => Some(err),
             Self::CacheDecode { source, .. } => Some(source),
             Self::CacheEncode(err) => Some(err),
+            Self::Settings(err) => Some(err),
             Self::DeferredFailures(failures) => {
                 failures.iter().find_map(|failure| failure.source())
             }
@@ -386,7 +512,8 @@ impl Error for UpdatesError {
             Self::Http { .. }
             | Self::ApiStatus { .. }
             | Self::NoMatchingRelease { .. }
-            | Self::NotModifiedWithoutCache { .. } => None,
+            | Self::NotModifiedWithoutCache { .. }
+            | Self::SettingsInvariant(_) => None,
         }
     }
 }
@@ -394,6 +521,12 @@ impl Error for UpdatesError {
 impl From<io::Error> for UpdatesError {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<SettingsError> for UpdatesError {
+    fn from(value: SettingsError) -> Self {
+        Self::Settings(value)
     }
 }
 
@@ -914,16 +1047,67 @@ fn run_updates_command_with<
     cache_store: &S,
     now_unix_seconds: u64,
 ) -> Result<(), UpdatesError> {
+    let background_settings = EnvBackgroundUpdateSettings;
+    let context = UpdatesRunContext {
+        version,
+        client,
+        notifier,
+        cache_store,
+        background_settings: &background_settings,
+        now_unix_seconds,
+    };
+    run_updates_command_with_background_settings(command, writer, context)
+}
+
+struct UpdatesRunContext<'a, C, N, S, B> {
+    version: VersionInfo,
+    client: &'a C,
+    notifier: &'a N,
+    cache_store: &'a S,
+    background_settings: &'a B,
+    now_unix_seconds: u64,
+}
+
+fn run_updates_command_with_background_settings<
+    W: io::Write,
+    C: GitHubReleasesClient,
+    N: UpdateNotificationHandoff,
+    S: UpdateCacheStore,
+    B: BackgroundUpdateSettings,
+>(
+    command: UpdatesCommand,
+    writer: &mut W,
+    context: UpdatesRunContext<'_, C, N, S, B>,
+) -> Result<(), UpdatesError> {
+    let command = match command {
+        UpdatesCommand::Check { .. } => command,
+        UpdatesCommand::BackgroundCheck => {
+            let policy = context
+                .background_settings
+                .background_update_check_policy()?;
+            let Some(command) = policy.check_command() else {
+                writer.write_all(b"background: skipped (automatic update checks disabled)\n")?;
+                return Ok(());
+            };
+            command
+        }
+    };
     let notify = command.notify();
     let mut deferred_failures = Vec::new();
-    let mut cache = match cache_store.load() {
+    let mut cache = match context.cache_store.load() {
         Ok(cache) => cache,
         Err(err) => {
             deferred_failures.push(UpdatesDeferredFailure::Cache(Box::new(err)));
             UpdateCheckCache::default()
         }
     };
-    let result = check_updates_with_cache(command, version, client, &mut cache, now_unix_seconds)?;
+    let result = check_updates_with_cache(
+        command,
+        context.version,
+        context.client,
+        &mut cache,
+        context.now_unix_seconds,
+    )?;
 
     writer.write_all(result.render().as_bytes())?;
     let notification_decision =
@@ -939,13 +1123,13 @@ fn run_updates_command_with<
         UpdateNotificationDecision::Notify { reason } => {
             let notification_result = result
                 .notification_request()
-                .and_then(|request| notifier.show_update_notification(&request));
+                .and_then(|request| context.notifier.show_update_notification(&request));
             match notification_result {
                 Ok(_) => {
                     cache.record_notification(
                         result.check_channel,
                         &result.latest,
-                        now_unix_seconds,
+                        context.now_unix_seconds,
                     );
                     writer.write_all(render_update_notification_sent(reason).as_bytes())?;
                 }
@@ -963,7 +1147,7 @@ fn run_updates_command_with<
             }
         }
     }
-    if let Err(err) = cache_store.save(&cache) {
+    if let Err(err) = context.cache_store.save(&cache) {
         deferred_failures.push(UpdatesDeferredFailure::Cache(Box::new(err)));
     }
 
@@ -1009,6 +1193,16 @@ fn check_updates_with_cache<C: GitHubReleasesClient>(
                 latest,
             })
         }
+        UpdatesCommand::BackgroundCheck => check_updates_with_cache(
+            UpdatesCommand::Check {
+                channel: None,
+                notify: true,
+            },
+            current,
+            client,
+            cache,
+            now_unix_seconds,
+        ),
     }
 }
 
@@ -1144,13 +1338,15 @@ mod tests {
     use super::{
         atomic_write_file, check_updates, check_updates_with_cache,
         evaluate_update_notification_policy, parse_release_version, resolve_update_cache_path,
-        run_updates_command_with, CachedReleaseInfo, CachedUpdateCheck, CachedUpdateNotification,
+        run_updates_command_with, run_updates_command_with_background_settings,
+        BackgroundUpdateAutoCheck, BackgroundUpdateChannel, BackgroundUpdateCheckPolicy,
+        BackgroundUpdateSettings, CachedReleaseInfo, CachedUpdateCheck, CachedUpdateNotification,
         DefaultUpdateCacheStore, FileUpdateCacheStore, GitHubReleaseResponse, GitHubReleasesClient,
         ReleaseEndpoint, ReleaseInfo, UpdateCachePathError, UpdateCachePathSources,
         UpdateCacheStore, UpdateChannel, UpdateCheckCache, UpdateNotificationDecision,
         UpdateNotificationPolicyInput, UpdateNotificationReason, UpdateNotificationSkipReason,
-        UpdatesCommand, UpdatesDeferredFailure, UpdatesError, UreqGitHubReleasesClient,
-        PRERELEASE_PAGE_SIZE,
+        UpdatesCommand, UpdatesDeferredFailure, UpdatesError, UpdatesRunContext,
+        UreqGitHubReleasesClient, PRERELEASE_PAGE_SIZE,
     };
     use crate::session_notifications::{
         UpdateNotificationError, UpdateNotificationHandoff, UpdateNotificationOutcome,
@@ -1314,6 +1510,57 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct StaticBackgroundUpdateSettings {
+        policy: BackgroundUpdateCheckPolicy,
+    }
+
+    impl StaticBackgroundUpdateSettings {
+        fn enabled(channel: BackgroundUpdateChannel) -> Self {
+            Self {
+                policy: BackgroundUpdateCheckPolicy {
+                    auto_check: BackgroundUpdateAutoCheck::Enabled,
+                    channel,
+                },
+            }
+        }
+
+        fn disabled() -> Self {
+            Self {
+                policy: BackgroundUpdateCheckPolicy {
+                    auto_check: BackgroundUpdateAutoCheck::Disabled,
+                    channel: BackgroundUpdateChannel::Auto,
+                },
+            }
+        }
+    }
+
+    impl BackgroundUpdateSettings for StaticBackgroundUpdateSettings {
+        fn background_update_check_policy(
+            &self,
+        ) -> Result<BackgroundUpdateCheckPolicy, UpdatesError> {
+            Ok(self.policy)
+        }
+    }
+
+    fn updates_run_context<'a, C, N, S, B>(
+        version: VersionInfo,
+        client: &'a C,
+        notifier: &'a N,
+        cache_store: &'a S,
+        background_settings: &'a B,
+        now_unix_seconds: u64,
+    ) -> UpdatesRunContext<'a, C, N, S, B> {
+        UpdatesRunContext {
+            version,
+            client,
+            notifier,
+            cache_store,
+            background_settings,
+            now_unix_seconds,
+        }
+    }
+
     fn version_info(version: &'static str, channel: ReleaseChannel) -> VersionInfo {
         VersionInfo::for_testing(version, channel, Some("test"))
     }
@@ -1420,6 +1667,10 @@ mod tests {
             channel,
             notify: true,
         }
+    }
+
+    fn background_check() -> UpdatesCommand {
+        UpdatesCommand::BackgroundCheck
     }
 
     #[test]
@@ -1977,6 +2228,160 @@ mod tests {
             TEST_NOW + 1
         );
         assert!(notifier.notifications().is_empty());
+    }
+
+    #[test]
+    fn background_update_check_skips_without_github_or_cache_when_disabled() {
+        let client = MockGitHubReleasesClient::new_responses(vec![]);
+        let notifier = RecordingNotifier::default();
+        let cache_store = MemoryUpdateCacheStore::default();
+        let background_settings = StaticBackgroundUpdateSettings::disabled();
+        let mut output = Vec::new();
+
+        run_updates_command_with_background_settings(
+            background_check(),
+            &mut output,
+            updates_run_context(
+                version_info("1.1.0", ReleaseChannel::Stable),
+                &client,
+                &notifier,
+                &cache_store,
+                &background_settings,
+                TEST_NOW,
+            ),
+        )
+        .expect("disabled background update check should succeed");
+
+        assert_eq!(
+            rendered(&output),
+            "background: skipped (automatic update checks disabled)\n"
+        );
+        assert!(client.requests_with_etags().is_empty());
+        assert!(notifier.notifications().is_empty());
+        assert_eq!(cache_store.cache(), UpdateCheckCache::default());
+    }
+
+    #[test]
+    fn background_update_check_uses_auto_channel_and_notifies() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(stable_release("v1.1.1"))]);
+        let notifier = RecordingNotifier::default();
+        let cache_store = MemoryUpdateCacheStore::default();
+        let background_settings =
+            StaticBackgroundUpdateSettings::enabled(BackgroundUpdateChannel::Auto);
+        let mut output = Vec::new();
+
+        run_updates_command_with_background_settings(
+            background_check(),
+            &mut output,
+            updates_run_context(
+                version_info("1.1.0", ReleaseChannel::Stable),
+                &client,
+                &notifier,
+                &cache_store,
+                &background_settings,
+                TEST_NOW,
+            ),
+        )
+        .expect("enabled background update check should succeed");
+
+        assert!(rendered(&output).contains("status: update available"));
+        assert!(rendered(&output).contains("notification: sent (new release)"));
+        assert_eq!(notifier.notifications().len(), 1);
+        assert_eq!(
+            client.requests(),
+            vec![(
+                "https://api.example.test/releases/latest".to_string(),
+                "lg-buddy/1.1.0".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn background_update_check_uses_configured_prerelease_channel() {
+        let client = MockGitHubReleasesClient::new(vec![Ok(format!(
+            "[{},{}]",
+            stable_release("v1.1.0"),
+            prerelease("v1.2.0-beta.1")
+        ))]);
+        let notifier = RecordingNotifier::default();
+        let cache_store = MemoryUpdateCacheStore::default();
+        let background_settings =
+            StaticBackgroundUpdateSettings::enabled(BackgroundUpdateChannel::Prerelease);
+        let mut output = Vec::new();
+
+        run_updates_command_with_background_settings(
+            background_check(),
+            &mut output,
+            updates_run_context(
+                version_info("1.1.0", ReleaseChannel::Stable),
+                &client,
+                &notifier,
+                &cache_store,
+                &background_settings,
+                TEST_NOW,
+            ),
+        )
+        .expect("configured prerelease background update check should succeed");
+
+        assert!(rendered(&output).contains("latest: 1.2.0-beta.1 (prerelease)"));
+        assert_eq!(notifier.notifications().len(), 1);
+        assert_eq!(
+            client.requests(),
+            vec![(
+                "https://api.example.test/releases?per_page=20".to_string(),
+                "lg-buddy/1.1.0".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn background_update_check_reuses_notification_policy_for_repeated_release() {
+        let client = MockGitHubReleasesClient::new_responses(vec![
+            Ok(api_response(
+                stable_release("v1.1.1"),
+                Some("\"stable-etag\""),
+            )),
+            Ok(GitHubReleaseResponse::NotModified),
+        ]);
+        let notifier = RecordingNotifier::default();
+        let cache_store = MemoryUpdateCacheStore::default();
+        let background_settings =
+            StaticBackgroundUpdateSettings::enabled(BackgroundUpdateChannel::Stable);
+        let mut first_output = Vec::new();
+        let mut second_output = Vec::new();
+
+        run_updates_command_with_background_settings(
+            background_check(),
+            &mut first_output,
+            updates_run_context(
+                version_info("1.1.0", ReleaseChannel::Stable),
+                &client,
+                &notifier,
+                &cache_store,
+                &background_settings,
+                TEST_NOW,
+            ),
+        )
+        .expect("initial background update check should succeed");
+        run_updates_command_with_background_settings(
+            background_check(),
+            &mut second_output,
+            updates_run_context(
+                version_info("1.1.0", ReleaseChannel::Stable),
+                &client,
+                &notifier,
+                &cache_store,
+                &background_settings,
+                TEST_NOW + 1,
+            ),
+        )
+        .expect("repeated background update check should succeed");
+
+        assert!(rendered(&first_output).contains("notification: sent (new release)"));
+        assert!(
+            rendered(&second_output).contains("notification: skipped (already shown for 1.1.1)")
+        );
+        assert_eq!(notifier.notifications().len(), 1);
     }
 
     #[test]

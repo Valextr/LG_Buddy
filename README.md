@@ -92,6 +92,8 @@ LG Buddy is mostly automatic after installation.
 - To inspect the installed runtime version, run `lg-buddy --version`
 - To check GitHub releases on demand, run `lg-buddy updates check`; add
   `--notify` to send a desktop notification when an update is available
+- Background update checks are installed by default; opt out with
+  `lg-buddy settings set updates.auto_check disabled`
 - To rerun full setup for TV IP, MAC address, or HDMI input, run `./configure.sh`
 - To check the screen monitor, run `systemctl --user status LG_Buddy_screen.service`
 - To remove LG Buddy, run `./uninstall.sh`
@@ -106,6 +108,8 @@ lg-buddy settings describe screen.restore_policy
 lg-buddy settings set screen.idle_timeout 600
 lg-buddy settings set screen.restore_policy aggressive
 lg-buddy settings set system.sleep_wake_policy disabled
+lg-buddy settings set updates.auto_check disabled
+lg-buddy settings set updates.channel prerelease
 lg-buddy settings unset screen.restore_policy
 ```
 
@@ -118,6 +122,8 @@ tvs_primary_input=HDMI_2
 screen_idle_timeout=300
 screen_restore_policy=conservative
 system_sleep_wake_policy=enabled
+updates_auto_check=enabled
+updates_channel=auto
 ```
 
 `tv_ip`, `tv_mac`, and `input` are still accepted as legacy single-TV keys, but
@@ -140,6 +146,13 @@ Set `screen_restore_policy=aggressive` to let session wake/activity and system w
 `system_sleep_wake_policy=disabled` if you do not want LG Buddy to control the
 TV around system sleep and wake. The lifecycle service and NetworkManager
 pre-down hook stay installed and no-op while the policy is disabled.
+
+`updates_auto_check=enabled` is the default. Set
+`updates_auto_check=disabled` if you do not want the installed user timer to
+check for updates and notify you when a release is available. Manual
+`lg-buddy updates check` commands still work when automatic checks are disabled.
+`updates_channel=auto` follows the installed build channel; set it to `stable`
+or `prerelease` to control the scheduled check channel.
 
 ## More Help
 

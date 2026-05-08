@@ -118,12 +118,15 @@ assert_file "$BUNDLE_DIR/docs/release-process.md"
 assert_file "$BUNDLE_DIR/systemd/LG_Buddy.service"
 assert_file "$BUNDLE_DIR/systemd/LG_Buddy_lifecycle.service"
 assert_file "$BUNDLE_DIR/systemd/LG_Buddy_screen.service"
+assert_file "$BUNDLE_DIR/systemd/LG_Buddy_update_check.service"
+assert_file "$BUNDLE_DIR/systemd/LG_Buddy_update_check.timer"
 
 HELP_OUTPUT="$("$BUNDLE_DIR/lg-buddy" 2>&1 || true)"
 printf '%s\n' "$HELP_OUTPUT" | grep -q "lg-buddy"
 printf '%s\n' "$HELP_OUTPUT" | grep -q "settings list"
 printf '%s\n' "$HELP_OUTPUT" | grep -q "settings set <key> <value>"
 printf '%s\n' "$HELP_OUTPUT" | grep -F -q "updates check [--channel stable|prerelease] [--notify]"
+printf '%s\n' "$HELP_OUTPUT" | grep -F -q "updates background-check"
 
 VERSION_OUTPUT="$("$BUNDLE_DIR/lg-buddy" --version)"
 printf '%s\n' "$VERSION_OUTPUT" | grep -q "^lg-buddy "
@@ -165,6 +168,9 @@ LIFECYCLE_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_lifecycle.service"
 LEGACY_SLEEP_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_sleep.service"
 LEGACY_WAKE_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_wake.service"
 USER_SCREEN_SERVICE="$HOME/.config/systemd/user/LG_Buddy_screen.service"
+USER_UPDATE_CHECK_SERVICE="$HOME/.config/systemd/user/LG_Buddy_update_check.service"
+USER_UPDATE_CHECK_TIMER="$HOME/.config/systemd/user/LG_Buddy_update_check.timer"
+USER_UPDATE_CHECK_OVERRIDE="$HOME/.config/systemd/user/LG_Buddy_update_check.service.d/config.conf"
 DESKTOP_ENTRY="$INSTALL_ROOT/usr/share/applications/LG_Buddy_Brightness.desktop"
 NM_SLEEP_HOOK="$INSTALL_ROOT/etc/NetworkManager/dispatcher.d/pre-down.d/LG_Buddy_sleep"
 NM_LIFECYCLE_HOOK="$INSTALL_ROOT/etc/NetworkManager/dispatcher.d/pre-down.d/LG_Buddy_lifecycle"
@@ -180,6 +186,9 @@ assert_file "$INSTALLED_POINTER"
 assert_file "$SYSTEM_SERVICE"
 assert_file "$LIFECYCLE_SERVICE"
 assert_file "$USER_SCREEN_SERVICE"
+assert_file "$USER_UPDATE_CHECK_SERVICE"
+assert_file "$USER_UPDATE_CHECK_TIMER"
+assert_file "$USER_UPDATE_CHECK_OVERRIDE"
 assert_file "$DESKTOP_ENTRY"
 [ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
     echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
@@ -216,6 +225,7 @@ printf '%s\n' "$INSTALLED_HELP_OUTPUT" | grep -q "lg-buddy"
 printf '%s\n' "$INSTALLED_HELP_OUTPUT" | grep -q "settings list"
 printf '%s\n' "$INSTALLED_HELP_OUTPUT" | grep -q "settings set <key> <value>"
 printf '%s\n' "$INSTALLED_HELP_OUTPUT" | grep -F -q "updates check [--channel stable|prerelease] [--notify]"
+printf '%s\n' "$INSTALLED_HELP_OUTPUT" | grep -F -q "updates background-check"
 
 INSTALLED_VERSION_OUTPUT="$("$INSTALLED_BINARY" --version)"
 printf '%s\n' "$INSTALLED_VERSION_OUTPUT" | grep -q "^lg-buddy "
@@ -232,12 +242,17 @@ grep -q '^screen_idle_timeout=86400$' "$CONFIG_FILE"
 "$INSTALLED_BINARY" settings set tv.ip 192.168.1.12
 "$INSTALLED_BINARY" settings set tv.mac 22:33:44:55:66:77
 "$INSTALLED_BINARY" settings set tv.input HDMI_4
+"$INSTALLED_BINARY" settings get updates.auto_check | grep -q '^enabled$'
+"$INSTALLED_BINARY" settings set updates.auto_check disabled
+"$INSTALLED_BINARY" settings set updates.channel prerelease
 grep -q '^screen_backend=gnome$' "$CONFIG_FILE"
 grep -q '^screen_idle_timeout=900$' "$CONFIG_FILE"
 grep -q '^screen_restore_policy=aggressive$' "$CONFIG_FILE"
 grep -q '^tvs_primary_ip=192.168.1.12$' "$CONFIG_FILE"
 grep -q '^tvs_primary_mac=22:33:44:55:66:77$' "$CONFIG_FILE"
 grep -q '^tvs_primary_input=HDMI_4$' "$CONFIG_FILE"
+grep -q '^updates_auto_check=disabled$' "$CONFIG_FILE"
+grep -q '^updates_channel=prerelease$' "$CONFIG_FILE"
 
 (
     unset LG_BUDDY_SCREEN_BACKEND
@@ -258,6 +273,8 @@ grep -q '^screen_backend=gnome$' "$CONFIG_FILE"
 grep -q '^screen_idle_timeout=900$' "$CONFIG_FILE"
 grep -q '^screen_restore_policy=aggressive$' "$CONFIG_FILE"
 grep -q '^system_sleep_wake_policy=enabled$' "$CONFIG_FILE"
+grep -q '^updates_auto_check=disabled$' "$CONFIG_FILE"
+grep -q '^updates_channel=prerelease$' "$CONFIG_FILE"
 
 export LG_BUDDY_REMOVE_CONFIG="1"
 (
@@ -289,6 +306,18 @@ export LG_BUDDY_REMOVE_CONFIG="1"
     echo "User screen service still present after uninstall: $USER_SCREEN_SERVICE"
     exit 1
 }
+[ ! -e "$USER_UPDATE_CHECK_SERVICE" ] || {
+    echo "User update check service still present after uninstall: $USER_UPDATE_CHECK_SERVICE"
+    exit 1
+}
+[ ! -e "$USER_UPDATE_CHECK_TIMER" ] || {
+    echo "User update check timer still present after uninstall: $USER_UPDATE_CHECK_TIMER"
+    exit 1
+}
+[ ! -e "$USER_UPDATE_CHECK_OVERRIDE" ] || {
+    echo "User update check override still present after uninstall: $USER_UPDATE_CHECK_OVERRIDE"
+    exit 1
+}
 [ ! -e "$DESKTOP_ENTRY" ] || {
     echo "Desktop entry still present after uninstall: $DESKTOP_ENTRY"
     exit 1
@@ -318,6 +347,9 @@ assert_executable "$INSTALLED_BINARY"
 assert_file "$SYSTEM_SERVICE"
 assert_file "$LIFECYCLE_SERVICE"
 assert_file "$USER_SCREEN_SERVICE"
+assert_file "$USER_UPDATE_CHECK_SERVICE"
+assert_file "$USER_UPDATE_CHECK_TIMER"
+assert_file "$USER_UPDATE_CHECK_OVERRIDE"
 [ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
     echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
     exit 1
@@ -345,6 +377,14 @@ grep -q '^system_sleep_wake_policy=disabled$' "$CONFIG_FILE"
 }
 [ ! -e "$LIFECYCLE_SERVICE" ] || {
     echo "Lifecycle service still present after disabled-policy uninstall: $LIFECYCLE_SERVICE"
+    exit 1
+}
+[ ! -e "$USER_UPDATE_CHECK_SERVICE" ] || {
+    echo "User update check service still present after disabled-policy uninstall: $USER_UPDATE_CHECK_SERVICE"
+    exit 1
+}
+[ ! -e "$USER_UPDATE_CHECK_TIMER" ] || {
+    echo "User update check timer still present after disabled-policy uninstall: $USER_UPDATE_CHECK_TIMER"
     exit 1
 }
 [ ! -e "$CONFIG_FILE" ] || {

@@ -78,6 +78,8 @@ tvs_primary_mac=aa:bb:cc:dd:ee:ff
 tvs_primary_input=HDMI_2
 screen_restore_policy=conservative
 system_sleep_wake_policy=enabled
+updates_auto_check=enabled
+updates_channel=auto
 ```
 
 Avoid adding installer-only state for product behavior. Environment variables
@@ -121,3 +123,20 @@ choice.
 - the supported values are `enabled` and `disabled`
 - lifecycle service and NetworkManager hook installation are integration
   topology, while this setting controls runtime policy
+
+`updates_auto_check` follows the same opt-out model:
+
+- automatic update checks should default to enabled
+- the installer should not ask every user whether update checks should run
+- users who do not want background checks should opt out through `config.env` or
+  `lg-buddy settings set updates.auto_check disabled`
+- disabling automatic checks disables/stops the user timer instead of merely
+  suppressing notifications after doing the work
+
+`updates_channel` keeps scheduled update checks configurable without changing
+manual diagnostics:
+
+- `auto` is the default and follows the installed build channel
+- `stable` and `prerelease` are explicit scheduled-check choices
+- manual `lg-buddy updates check --channel ...` still overrides channel for
+  that invocation only

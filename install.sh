@@ -108,6 +108,9 @@ DESKTOP_ENTRY_PATH="${APPLICATIONS_DIR}/LG_Buddy_Brightness.desktop"
 USER_SYSTEMD_DIR="${HOME}/.config/systemd/user"
 USER_SCREEN_SERVICE_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_screen.service"
 USER_SCREEN_OVERRIDE_DIR="${USER_SYSTEMD_DIR}/LG_Buddy_screen.service.d"
+USER_UPDATE_CHECK_SERVICE_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_update_check.service"
+USER_UPDATE_CHECK_TIMER_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_update_check.timer"
+USER_UPDATE_CHECK_OVERRIDE_DIR="${USER_SYSTEMD_DIR}/LG_Buddy_update_check.service.d"
 
 check_dep() {
     local label="$1"
@@ -287,6 +290,11 @@ case "$SYSTEM_SLEEP_WAKE_POLICY" in
     enabled|disabled) ;;
     *) SYSTEM_SLEEP_WAKE_POLICY="enabled" ;;
 esac
+UPDATE_AUTO_CHECK="$(sed -n 's/^updates_auto_check=//p' "$CONFIG_FILE" | tail -n1)"
+case "$UPDATE_AUTO_CHECK" in
+    enabled|disabled) ;;
+    *) UPDATE_AUTO_CHECK="enabled" ;;
+esac
 echo "Using configuration file at $CONFIG_FILE"
 echo "Configuration complete."
 
@@ -411,14 +419,31 @@ else
 fi
 echo "Done."
 
-# 8. INSTALL SCREEN MONITOR USER SERVICE
-echo "Installing screen monitor user service..."
+# 8. INSTALL USER SERVICES
+echo "Installing background update check user timer..."
 mkdir -p "$USER_SYSTEMD_DIR"
+cp "$SCRIPT_DIR/systemd/LG_Buddy_update_check.service" "$USER_UPDATE_CHECK_SERVICE_PATH"
+cp "$SCRIPT_DIR/systemd/LG_Buddy_update_check.timer" "$USER_UPDATE_CHECK_TIMER_PATH"
+mkdir -p "$USER_UPDATE_CHECK_OVERRIDE_DIR"
+write_config_override "${USER_UPDATE_CHECK_OVERRIDE_DIR}/config.conf" "$CONFIG_FILE"
+echo "Done."
+
+echo "Installing screen monitor user service..."
 cp "$SCRIPT_DIR/systemd/LG_Buddy_screen.service" "$USER_SCREEN_SERVICE_PATH"
 mkdir -p "$USER_SCREEN_OVERRIDE_DIR"
 write_config_override "${USER_SCREEN_OVERRIDE_DIR}/config.conf" "$CONFIG_FILE"
 if [ "$SKIP_SYSTEMD_ACTIONS" != "1" ]; then
     systemctl --user daemon-reload
+fi
+
+if [ "$SKIP_SYSTEMD_ACTIONS" = "1" ]; then
+    echo "Skipping update check timer enable/start because LG_BUDDY_SKIP_SYSTEMD_ACTIONS=1."
+elif [ "$UPDATE_AUTO_CHECK" = "enabled" ]; then
+    systemctl --user enable --now LG_Buddy_update_check.timer
+    echo "LG_Buddy_update_check.timer enabled and started."
+else
+    systemctl --user disable --now LG_Buddy_update_check.timer 2>/dev/null || true
+    echo "LG_Buddy_update_check.timer installed but disabled by config."
 fi
 
 if [ "$SCREEN_MONITOR_AVAILABLE" -eq 1 ]; then

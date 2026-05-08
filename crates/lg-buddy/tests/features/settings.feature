@@ -11,6 +11,8 @@ Feature: Settings CLI
     And stdout contains "screen.backend=auto (config.env, read-write, ops: get,describe,set,unset)"
     And stdout contains "screen.restore_policy=conservative (default, read-write, ops: get,describe,set,unset)"
     And stdout contains "system.sleep_wake_policy=enabled (default, read-write, ops: get,describe,set,unset)"
+    And stdout contains "updates.auto_check=enabled (default, read-write, ops: get,describe,set,unset)"
+    And stdout contains "updates.channel=auto (default, read-write, ops: get,describe,set,unset)"
 
   Scenario: settings describe shows required TV operations
     Given a temporary LG Buddy config using input HDMI_2
@@ -28,6 +30,15 @@ Feature: Settings CLI
     And stdout contains "system.sleep_wake_policy"
     And stdout contains "mutability: read-write"
     And stdout contains "supported operations: get, describe, set, unset"
+
+  Scenario: settings describe shows update check operations
+    Given a temporary LG Buddy config using input HDMI_2
+    When I run the command "settings describe updates.auto_check"
+    Then the command succeeds
+    And stdout contains "updates.auto_check"
+    And stdout contains "storage key: updates_auto_check"
+    And stdout contains "allowed values: enabled, disabled"
+    And stdout contains "apply: manage-update-check-timer"
 
   Scenario: settings set writes config.env and reports skipped apply
     Given a temporary LG Buddy config using input HDMI_2
@@ -98,3 +109,12 @@ Feature: Settings CLI
     And stdout contains "system.sleep_wake_policy=disabled"
     And stdout contains "apply: no runtime apply action required"
     And config.env contains "system_sleep_wake_policy=disabled"
+
+  Scenario: settings set writes update check opt out
+    Given a temporary LG Buddy config using input HDMI_2
+    And systemd apply actions are skipped
+    When I run the command "settings set updates.auto_check disabled"
+    Then the command succeeds
+    And stdout contains "updates.auto_check=disabled"
+    And stdout contains "apply: skipped systemd apply"
+    And config.env contains "updates_auto_check=disabled"

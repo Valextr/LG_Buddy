@@ -40,6 +40,7 @@ lg-buddy brightness set 65
 lg-buddy --version
 lg-buddy updates check
 lg-buddy updates check --notify
+lg-buddy updates background-check
 ```
 
 In normal use, systemd starts the relevant commands automatically. Most users
@@ -63,6 +64,10 @@ the desktop notification service supports actions, the notification includes a
 opener. After a notification is delivered for a release, repeated `--notify`
 checks for the same release skip the notification and print the notification
 policy decision; a newer release can notify again.
+`updates background-check` is the service-owned path used by the installed user
+timer. It reads update settings, skips all update work when automatic checks are
+disabled, and otherwise uses the same release API, cache, notification handoff,
+and repeat-notification policy as `updates check --notify`.
 
 `lifecycle`, `nm-pre-down`, `sleep-pre`, and `startup wake` are normally
 service-owned system lifecycle commands. They are documented for
@@ -167,14 +172,18 @@ To change supported settings:
 lg-buddy settings set tv.input HDMI_2
 lg-buddy settings set screen.idle_timeout 600
 lg-buddy settings set screen.restore_policy aggressive
+lg-buddy settings set updates.auto_check disabled
+lg-buddy settings set updates.channel prerelease
 lg-buddy settings unset screen.restore_policy
 ```
 
 `set` and `unset` write `config.env` and then apply the setting when an explicit
 runtime apply step is needed. Screen-monitor settings restart
 `LG_Buddy_screen.service` when the user service is installed and active or
-enabled. TV identity and system sleep/wake policy changes are read by later
-runtime actions and do not require a service restart.
+enabled. `updates.auto_check` enables or disables the installed user timer for
+background update checks. TV identity, system sleep/wake policy, and update
+channel changes are read by later runtime actions and do not require a service
+restart.
 
 To rerun full setup for TV IP, MAC address, HDMI input, or install-time service
 wiring:
@@ -199,6 +208,8 @@ Current config keys:
 - `screen_idle_timeout`
 - `screen_restore_policy`
 - `system_sleep_wake_policy`
+- `updates_auto_check`
+- `updates_channel`
 
 Legacy single-TV keys `tv_ip`, `tv_mac`, and `input` are still read as fallback
 values for existing installs. New writes use `tvs_primary_*` storage keys.
@@ -221,6 +232,8 @@ Current structured settings:
 | `screen.idle_timeout` | `screen_idle_timeout` | `get`, `describe`, `set`, `unset` |
 | `screen.restore_policy` | `screen_restore_policy` | `get`, `describe`, `set`, `unset` |
 | `system.sleep_wake_policy` | `system_sleep_wake_policy` | `get`, `describe`, `set`, `unset` |
+| `updates.auto_check` | `updates_auto_check` | `get`, `describe`, `set`, `unset` |
+| `updates.channel` | `updates_channel` | `get`, `describe`, `set`, `unset` |
 
 The `tv.*` settings expose the single supported TV in the public API. Their
 storage keys are profile-shaped only to leave room for future storage growth;
@@ -250,6 +263,23 @@ value is `disabled`. The NetworkManager pre-down hook also reads config on each
 invocation, so `lg-buddy settings set system.sleep_wake_policy <value>` changes
 runtime policy without reinstalling services.
 
+`updates_auto_check` controls automatic background update checks:
+
+- `enabled`: default behavior, let the installed user timer periodically check
+  GitHub releases and notify when an update is available
+- `disabled`: leave the timer units installed, but disable the timer and skip
+  background update work
+
+Manual `lg-buddy updates check` commands still work when automatic checks are
+disabled.
+
+`updates_channel` controls the channel used by automatic background checks:
+
+- `auto`: default behavior, stable/dev builds check stable releases and
+  prerelease builds check the prerelease channel
+- `stable`: only consider stable releases
+- `prerelease`: consider prereleases and stable releases
+
 Example:
 
 ```ini
@@ -259,6 +289,8 @@ tvs_primary_input=HDMI_2
 screen_idle_timeout=300
 screen_restore_policy=aggressive
 system_sleep_wake_policy=enabled
+updates_auto_check=enabled
+updates_channel=auto
 ```
 
 Installed services receive the resolved config path through `LG_BUDDY_CONFIG`.
