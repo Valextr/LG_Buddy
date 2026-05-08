@@ -60,7 +60,9 @@ running user-session LG Buddy process; if that process is not running,
 `--notify` reports a notification failure after printing the update result. When
 the desktop notification service supports actions, the notification includes a
 `View Release` button that opens the GitHub release page through the system
-opener.
+opener. After a notification is delivered for a release, repeated `--notify`
+checks for the same release skip the notification and print the notification
+policy decision; a newer release can notify again.
 
 `lifecycle`, `nm-pre-down`, `sleep-pre`, and `startup wake` are normally
 service-owned system lifecycle commands. They are documented for

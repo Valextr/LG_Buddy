@@ -434,6 +434,96 @@ impl ReleaseInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateNotificationReason {
+    NewRelease,
+}
+
+impl UpdateNotificationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NewRelease => "new release",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateNotificationSkipReason {
+    NotRequested,
+    NoUpdateAvailable,
+    AlreadyShownForRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateNotificationDecision {
+    Notify {
+        reason: UpdateNotificationReason,
+    },
+    Skip {
+        reason: UpdateNotificationSkipReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UpdateNotificationPolicyInput<'a> {
+    notify_requested: bool,
+    update_available: bool,
+    latest: &'a ReleaseInfo,
+    last_notification: Option<&'a CachedUpdateNotification>,
+}
+
+fn evaluate_update_notification_policy(
+    input: UpdateNotificationPolicyInput<'_>,
+) -> UpdateNotificationDecision {
+    if !input.notify_requested {
+        return UpdateNotificationDecision::Skip {
+            reason: UpdateNotificationSkipReason::NotRequested,
+        };
+    }
+
+    if !input.update_available {
+        return UpdateNotificationDecision::Skip {
+            reason: UpdateNotificationSkipReason::NoUpdateAvailable,
+        };
+    }
+
+    if input
+        .last_notification
+        .is_some_and(|notification| notification.matches_release(input.latest))
+    {
+        return UpdateNotificationDecision::Skip {
+            reason: UpdateNotificationSkipReason::AlreadyShownForRelease,
+        };
+    }
+
+    UpdateNotificationDecision::Notify {
+        reason: UpdateNotificationReason::NewRelease,
+    }
+}
+
+fn render_update_notification_sent(reason: UpdateNotificationReason) -> String {
+    format!("notification: sent ({})\n", reason.as_str())
+}
+
+fn render_update_notification_failure(reason: UpdateNotificationReason) -> String {
+    format!("notification: failed ({})\n", reason.as_str())
+}
+
+fn render_update_notification_skip(
+    reason: UpdateNotificationSkipReason,
+    latest: &ReleaseInfo,
+) -> String {
+    let reason = match reason {
+        UpdateNotificationSkipReason::NotRequested => "not requested".to_string(),
+        UpdateNotificationSkipReason::NoUpdateAvailable => "no update available".to_string(),
+        UpdateNotificationSkipReason::AlreadyShownForRelease => {
+            format!("already shown for {}", latest.version())
+        }
+    };
+
+    format!("notification: skipped ({reason})\n")
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct UpdateCheckCache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,10 +540,31 @@ impl UpdateCheckCache {
         }
     }
 
+    fn entry_mut(&mut self, channel: UpdateChannel) -> Option<&mut CachedUpdateCheck> {
+        match channel {
+            UpdateChannel::Stable => self.stable.as_mut(),
+            UpdateChannel::Prerelease => self.prerelease.as_mut(),
+        }
+    }
+
     fn set_entry(&mut self, channel: UpdateChannel, entry: CachedUpdateCheck) {
         match channel {
             UpdateChannel::Stable => self.stable = Some(entry),
             UpdateChannel::Prerelease => self.prerelease = Some(entry),
+        }
+    }
+
+    fn record_notification(
+        &mut self,
+        channel: UpdateChannel,
+        release: &ReleaseInfo,
+        shown_at: u64,
+    ) {
+        if let Some(entry) = self.entry_mut(channel) {
+            entry.last_notification = Some(CachedUpdateNotification {
+                shown_at_unix_seconds: shown_at,
+                release: release.to_cached(),
+            });
         }
     }
 }
@@ -464,6 +575,20 @@ struct CachedUpdateCheck {
     etag: Option<String>,
     last_checked_at_unix_seconds: u64,
     latest: CachedReleaseInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_notification: Option<CachedUpdateNotification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedUpdateNotification {
+    shown_at_unix_seconds: u64,
+    release: CachedReleaseInfo,
+}
+
+impl CachedUpdateNotification {
+    fn matches_release(&self, release: &ReleaseInfo) -> bool {
+        self.release.matches_release(release)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +596,14 @@ struct CachedReleaseInfo {
     version: String,
     channel: UpdateChannel,
     url: String,
+}
+
+impl CachedReleaseInfo {
+    fn matches_release(&self, release: &ReleaseInfo) -> bool {
+        self.version == release.version().to_string()
+            && self.channel == release.channel()
+            && self.url == release.url()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,12 +926,41 @@ fn run_updates_command_with<
     let result = check_updates_with_cache(command, version, client, &mut cache, now_unix_seconds)?;
 
     writer.write_all(result.render().as_bytes())?;
-    if notify && result.update_available() {
-        let notification_result = result
-            .notification_request()
-            .and_then(|request| notifier.show_update_notification(&request));
-        if let Err(err) = notification_result {
-            deferred_failures.push(UpdatesDeferredFailure::Notification(err));
+    let notification_decision =
+        evaluate_update_notification_policy(UpdateNotificationPolicyInput {
+            notify_requested: notify,
+            update_available: result.update_available(),
+            latest: &result.latest,
+            last_notification: cache
+                .entry(result.check_channel)
+                .and_then(|entry| entry.last_notification.as_ref()),
+        });
+    match notification_decision {
+        UpdateNotificationDecision::Notify { reason } => {
+            let notification_result = result
+                .notification_request()
+                .and_then(|request| notifier.show_update_notification(&request));
+            match notification_result {
+                Ok(_) => {
+                    cache.record_notification(
+                        result.check_channel,
+                        &result.latest,
+                        now_unix_seconds,
+                    );
+                    writer.write_all(render_update_notification_sent(reason).as_bytes())?;
+                }
+                Err(err) => {
+                    writer.write_all(render_update_notification_failure(reason).as_bytes())?;
+                    deferred_failures.push(UpdatesDeferredFailure::Notification(err));
+                }
+            }
+        }
+        UpdateNotificationDecision::Skip { reason } => {
+            if notify {
+                writer.write_all(
+                    render_update_notification_skip(reason, &result.latest).as_bytes(),
+                )?;
+            }
         }
     }
     if let Err(err) = cache_store.save(&cache) {
@@ -912,12 +1074,16 @@ where
     match response {
         GitHubReleaseResponse::Ok { body, etag } => {
             let latest = parse_latest(&body)?;
+            let last_notification = cache
+                .entry(channel)
+                .and_then(|entry| entry.last_notification.clone());
             cache.set_entry(
                 channel,
                 CachedUpdateCheck {
                     etag,
                     last_checked_at_unix_seconds: now_unix_seconds,
                     latest: latest.to_cached(),
+                    last_notification,
                 },
             );
             Ok(latest)
@@ -976,18 +1142,22 @@ fn current_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_write_file, check_updates, check_updates_with_cache, parse_release_version,
-        resolve_update_cache_path, run_updates_command_with, CachedReleaseInfo, CachedUpdateCheck,
+        atomic_write_file, check_updates, check_updates_with_cache,
+        evaluate_update_notification_policy, parse_release_version, resolve_update_cache_path,
+        run_updates_command_with, CachedReleaseInfo, CachedUpdateCheck, CachedUpdateNotification,
         DefaultUpdateCacheStore, FileUpdateCacheStore, GitHubReleaseResponse, GitHubReleasesClient,
-        ReleaseEndpoint, UpdateCachePathError, UpdateCachePathSources, UpdateCacheStore,
-        UpdateChannel, UpdateCheckCache, UpdatesCommand, UpdatesDeferredFailure, UpdatesError,
-        UreqGitHubReleasesClient, PRERELEASE_PAGE_SIZE,
+        ReleaseEndpoint, ReleaseInfo, UpdateCachePathError, UpdateCachePathSources,
+        UpdateCacheStore, UpdateChannel, UpdateCheckCache, UpdateNotificationDecision,
+        UpdateNotificationPolicyInput, UpdateNotificationReason, UpdateNotificationSkipReason,
+        UpdatesCommand, UpdatesDeferredFailure, UpdatesError, UreqGitHubReleasesClient,
+        PRERELEASE_PAGE_SIZE,
     };
     use crate::session_notifications::{
         UpdateNotificationError, UpdateNotificationHandoff, UpdateNotificationOutcome,
         UpdateNotificationRequest,
     };
     use crate::version::{ReleaseChannel, VersionInfo};
+    use semver::Version;
     use std::cell::RefCell;
     use std::fs;
     use std::io::{self, Read, Write};
@@ -1166,6 +1336,14 @@ mod tests {
         )
     }
 
+    fn release_info(version: &str, channel: UpdateChannel, url: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            version: Version::parse(version).expect("test version should parse"),
+            channel,
+            url: url.to_string(),
+        }
+    }
+
     fn api_response(body: String, etag: Option<&str>) -> GitHubReleaseResponse {
         GitHubReleaseResponse::Ok {
             body,
@@ -1188,7 +1366,42 @@ mod tests {
                 channel,
                 url: url.to_string(),
             },
+            last_notification: None,
         }
+    }
+
+    fn cached_notification(
+        version: &str,
+        channel: UpdateChannel,
+        url: &str,
+        shown_at_unix_seconds: u64,
+    ) -> CachedUpdateNotification {
+        CachedUpdateNotification {
+            shown_at_unix_seconds,
+            release: CachedReleaseInfo {
+                version: version.to_string(),
+                channel,
+                url: url.to_string(),
+            },
+        }
+    }
+
+    fn cached_entry_with_notification(
+        etag: Option<&str>,
+        version: &str,
+        channel: UpdateChannel,
+        url: &str,
+        last_checked_at_unix_seconds: u64,
+        notification_shown_at_unix_seconds: u64,
+    ) -> CachedUpdateCheck {
+        let mut entry = cached_entry(etag, version, channel, url, last_checked_at_unix_seconds);
+        entry.last_notification = Some(cached_notification(
+            version,
+            channel,
+            url,
+            notification_shown_at_unix_seconds,
+        ));
+        entry
     }
 
     fn rendered(output: &[u8]) -> String {
@@ -1207,6 +1420,110 @@ mod tests {
             channel,
             notify: true,
         }
+    }
+
+    #[test]
+    fn notification_policy_skips_when_notification_was_not_requested() {
+        let latest = release_info(
+            "1.1.1",
+            UpdateChannel::Stable,
+            "https://github.test/releases/tag/v1.1.1",
+        );
+
+        let decision = evaluate_update_notification_policy(UpdateNotificationPolicyInput {
+            notify_requested: false,
+            update_available: true,
+            latest: &latest,
+            last_notification: None,
+        });
+
+        assert_eq!(
+            decision,
+            UpdateNotificationDecision::Skip {
+                reason: UpdateNotificationSkipReason::NotRequested
+            }
+        );
+    }
+
+    #[test]
+    fn notification_policy_skips_when_no_update_is_available() {
+        let latest = release_info(
+            "1.1.0",
+            UpdateChannel::Stable,
+            "https://github.test/releases/tag/v1.1.0",
+        );
+
+        let decision = evaluate_update_notification_policy(UpdateNotificationPolicyInput {
+            notify_requested: true,
+            update_available: false,
+            latest: &latest,
+            last_notification: None,
+        });
+
+        assert_eq!(
+            decision,
+            UpdateNotificationDecision::Skip {
+                reason: UpdateNotificationSkipReason::NoUpdateAvailable
+            }
+        );
+    }
+
+    #[test]
+    fn notification_policy_skips_when_latest_release_was_already_shown() {
+        let latest = release_info(
+            "1.1.1",
+            UpdateChannel::Stable,
+            "https://github.test/releases/tag/v1.1.1",
+        );
+        let last_notification = cached_notification(
+            "1.1.1",
+            UpdateChannel::Stable,
+            "https://github.test/releases/tag/v1.1.1",
+            TEST_NOW - 1,
+        );
+
+        let decision = evaluate_update_notification_policy(UpdateNotificationPolicyInput {
+            notify_requested: true,
+            update_available: true,
+            latest: &latest,
+            last_notification: Some(&last_notification),
+        });
+
+        assert_eq!(
+            decision,
+            UpdateNotificationDecision::Skip {
+                reason: UpdateNotificationSkipReason::AlreadyShownForRelease
+            }
+        );
+    }
+
+    #[test]
+    fn notification_policy_notifies_when_latest_release_has_not_been_shown() {
+        let latest = release_info(
+            "1.1.2",
+            UpdateChannel::Stable,
+            "https://github.test/releases/tag/v1.1.2",
+        );
+        let last_notification = cached_notification(
+            "1.1.1",
+            UpdateChannel::Stable,
+            "https://github.test/releases/tag/v1.1.1",
+            TEST_NOW - 1,
+        );
+
+        let decision = evaluate_update_notification_policy(UpdateNotificationPolicyInput {
+            notify_requested: true,
+            update_available: true,
+            latest: &latest,
+            last_notification: Some(&last_notification),
+        });
+
+        assert_eq!(
+            decision,
+            UpdateNotificationDecision::Notify {
+                reason: UpdateNotificationReason::NewRelease
+            }
+        );
     }
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1321,12 +1638,13 @@ mod tests {
         let mut cache = UpdateCheckCache::default();
         cache.set_entry(
             UpdateChannel::Stable,
-            cached_entry(
+            cached_entry_with_notification(
                 Some("\"stable-etag\""),
                 "1.1.0",
                 UpdateChannel::Stable,
                 "https://github.test/releases/tag/v1.1.0",
                 TEST_NOW,
+                TEST_NOW + 1,
             ),
         );
         cache.set_entry(
@@ -1367,6 +1685,32 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).expect("remove test temp dir");
+    }
+
+    #[test]
+    fn cache_without_notification_state_loads_with_absent_notification() {
+        let cache: UpdateCheckCache = serde_json::from_str(
+            r#"{
+              "stable": {
+                "etag": "\"stable-etag\"",
+                "last_checked_at_unix_seconds": 1778234400,
+                "latest": {
+                  "version": "1.1.0",
+                  "channel": "stable",
+                  "url": "https://github.test/releases/tag/v1.1.0"
+                }
+              }
+            }"#,
+        )
+        .expect("legacy cache should decode");
+
+        assert_eq!(
+            cache
+                .entry(UpdateChannel::Stable)
+                .expect("stable cache entry")
+                .last_notification,
+            None
+        );
     }
 
     #[test]
@@ -1750,7 +2094,20 @@ mod tests {
         .expect_err("cache save failure should be reported after notification");
 
         assert!(rendered(&output).contains("status: update available"));
+        assert!(rendered(&output).contains("notification: sent (new release)"));
         assert_eq!(notifier.notifications().len(), 1);
+        assert_eq!(
+            cache_store
+                .cache()
+                .entry(UpdateChannel::Stable)
+                .expect("stable cache entry")
+                .last_notification
+                .as_ref()
+                .expect("notification state")
+                .release
+                .version,
+            "1.1.1"
+        );
         let UpdatesError::DeferredFailures(failures) = err else {
             panic!("expected deferred cache failure");
         };
@@ -1781,7 +2138,14 @@ mod tests {
         .expect_err("notification and cache failures should both be reported");
 
         assert!(rendered(&output).contains("status: update available"));
+        assert!(rendered(&output).contains("notification: failed (new release)"));
         assert_eq!(notifier.notifications().len(), 1);
+        assert!(cache_store
+            .cache()
+            .entry(UpdateChannel::Stable)
+            .expect("stable cache entry")
+            .last_notification
+            .is_none());
         let UpdatesError::DeferredFailures(failures) = err else {
             panic!("expected deferred failures");
         };
@@ -1828,7 +2192,20 @@ mod tests {
         .expect("notifying cached update check should succeed");
 
         assert!(rendered(&output).contains("status: update available"));
+        assert!(rendered(&output).contains("notification: sent (new release)"));
         assert_eq!(notifier.notifications().len(), 1);
+        assert_eq!(
+            cache_store
+                .cache()
+                .entry(UpdateChannel::Stable)
+                .expect("stable cache entry")
+                .last_notification
+                .as_ref()
+                .expect("notification state")
+                .release
+                .version,
+            "1.1.1"
+        );
     }
 
     #[test]
@@ -1862,6 +2239,7 @@ mod tests {
         .expect("notifying cached update check should succeed");
 
         assert!(rendered(&output).contains("status: up to date"));
+        assert!(rendered(&output).contains("notification: skipped (no update available)"));
         assert!(notifier.notifications().is_empty());
     }
 
@@ -1975,6 +2353,7 @@ mod tests {
         .expect("notifying update check should succeed");
 
         assert!(rendered(&output).contains("status: update available"));
+        assert!(rendered(&output).contains("notification: sent (new release)"));
         let notifications = notifier.notifications();
         assert_eq!(notifications.len(), 1);
         assert_eq!(
@@ -1987,6 +2366,130 @@ mod tests {
                 "stable".to_string(),
                 "https://github.test/releases/tag/v1.1.1".to_string()
             )
+        );
+        assert_eq!(
+            cache_store
+                .cache()
+                .entry(UpdateChannel::Stable)
+                .expect("stable cache entry")
+                .last_notification
+                .as_ref()
+                .expect("notification state")
+                .release
+                .version,
+            "1.1.1"
+        );
+    }
+
+    #[test]
+    fn notify_skips_repeated_notification_for_same_cached_release() {
+        let client = MockGitHubReleasesClient::new_responses(vec![
+            Ok(api_response(
+                stable_release("v1.1.1"),
+                Some("\"stable-etag\""),
+            )),
+            Ok(GitHubReleaseResponse::NotModified),
+        ]);
+        let notifier = RecordingNotifier::default();
+        let cache_store = MemoryUpdateCacheStore::default();
+        let mut first_output = Vec::new();
+        let mut second_output = Vec::new();
+
+        run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut first_output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+            &cache_store,
+            TEST_NOW,
+        )
+        .expect("initial notifying update check should succeed");
+        run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut second_output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+            &cache_store,
+            TEST_NOW + 1,
+        )
+        .expect("repeated notifying update check should succeed");
+
+        assert!(rendered(&first_output).contains("notification: sent (new release)"));
+        assert!(
+            rendered(&second_output).contains("notification: skipped (already shown for 1.1.1)")
+        );
+        assert_eq!(notifier.notifications().len(), 1);
+        assert_eq!(
+            client.requests_with_etags(),
+            vec![
+                (
+                    "https://api.example.test/releases/latest".to_string(),
+                    "lg-buddy/1.1.0".to_string(),
+                    None
+                ),
+                (
+                    "https://api.example.test/releases/latest".to_string(),
+                    "lg-buddy/1.1.0".to_string(),
+                    Some("\"stable-etag\"".to_string())
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn notify_sends_again_when_a_newer_release_is_available() {
+        let client = MockGitHubReleasesClient::new_responses(vec![
+            Ok(api_response(
+                stable_release("v1.1.1"),
+                Some("\"stable-etag-1\""),
+            )),
+            Ok(api_response(
+                stable_release("v1.1.2"),
+                Some("\"stable-etag-2\""),
+            )),
+        ]);
+        let notifier = RecordingNotifier::default();
+        let cache_store = MemoryUpdateCacheStore::default();
+        let mut first_output = Vec::new();
+        let mut second_output = Vec::new();
+
+        run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut first_output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+            &cache_store,
+            TEST_NOW,
+        )
+        .expect("initial notifying update check should succeed");
+        run_updates_command_with(
+            check_notify(Some(UpdateChannel::Stable)),
+            &mut second_output,
+            version_info("1.1.0", ReleaseChannel::Stable),
+            &client,
+            &notifier,
+            &cache_store,
+            TEST_NOW + 1,
+        )
+        .expect("newer release notifying update check should succeed");
+
+        assert!(rendered(&first_output).contains("notification: sent (new release)"));
+        assert!(rendered(&second_output).contains("notification: sent (new release)"));
+        assert_eq!(notifier.notifications().len(), 2);
+        assert_eq!(
+            cache_store
+                .cache()
+                .entry(UpdateChannel::Stable)
+                .expect("stable cache entry")
+                .last_notification
+                .as_ref()
+                .expect("notification state")
+                .release
+                .version,
+            "1.1.2"
         );
     }
 
@@ -2009,6 +2512,7 @@ mod tests {
         .expect("notifying update check should succeed");
 
         assert!(rendered(&output).contains("status: up to date"));
+        assert!(rendered(&output).contains("notification: skipped (no update available)"));
         assert!(notifier.notifications().is_empty());
     }
 
@@ -2031,7 +2535,14 @@ mod tests {
         .expect_err("notification failure should fail notifying update check");
 
         assert!(rendered(&output).contains("status: update available"));
+        assert!(rendered(&output).contains("notification: failed (new release)"));
         assert_eq!(notifier.notifications().len(), 1);
+        assert!(cache_store
+            .cache()
+            .entry(UpdateChannel::Stable)
+            .expect("stable cache entry")
+            .last_notification
+            .is_none());
         let UpdatesError::DeferredFailures(failures) = &err else {
             panic!("expected deferred notification failure");
         };
