@@ -51,6 +51,9 @@ RUN_STATE_DIR="$(prefix_path "/run/lg_buddy")"
 USER_SYSTEMD_DIR="${HOME}/.config/systemd/user"
 USER_SCREEN_SERVICE_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_screen.service"
 USER_SCREEN_OVERRIDE_DIR="${USER_SYSTEMD_DIR}/LG_Buddy_screen.service.d"
+USER_UPDATE_CHECK_SERVICE_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_update_check.service"
+USER_UPDATE_CHECK_TIMER_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_update_check.timer"
+USER_UPDATE_CHECK_OVERRIDE_DIR="${USER_SYSTEMD_DIR}/LG_Buddy_update_check.service.d"
 
 if [ -r "$SCRIPT_DIR/bin/LG_Buddy_Common" ]; then
     . "$SCRIPT_DIR/bin/LG_Buddy_Common"
@@ -77,11 +80,13 @@ else
     run_privileged systemctl disable LG_Buddy_lifecycle.service 2>/dev/null || true
     run_privileged systemctl disable LG_Buddy_wake.service 2>/dev/null || true
     run_privileged systemctl disable LG_Buddy_sleep.service 2>/dev/null || true
+    systemctl --user disable LG_Buddy_update_check.timer 2>/dev/null || true
     systemctl --user disable LG_Buddy_screen.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy_lifecycle.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy_wake.service 2>/dev/null || true
     run_privileged systemctl stop LG_Buddy_sleep.service 2>/dev/null || true
+    systemctl --user stop LG_Buddy_update_check.timer 2>/dev/null || true
     systemctl --user stop LG_Buddy_screen.service 2>/dev/null || true
 fi
 run_privileged rm -f "$SYSTEMD_SERVICE_PATH"
@@ -98,6 +103,9 @@ run_privileged rmdir "$SYSTEMD_WAKE_OVERRIDE_DIR" 2>/dev/null || true
 run_privileged rmdir "$SYSTEMD_SLEEP_OVERRIDE_DIR" 2>/dev/null || true
 rm -f "$USER_SCREEN_SERVICE_PATH"
 rm -rf "$USER_SCREEN_OVERRIDE_DIR"
+rm -f "$USER_UPDATE_CHECK_SERVICE_PATH"
+rm -f "$USER_UPDATE_CHECK_TIMER_PATH"
+rm -rf "$USER_UPDATE_CHECK_OVERRIDE_DIR"
 if [ "$SKIP_SYSTEMD_ACTIONS" != "1" ]; then
     run_privileged systemctl daemon-reload
     systemctl --user daemon-reload

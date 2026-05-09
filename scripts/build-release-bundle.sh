@@ -64,6 +64,8 @@ install -m 644 "$REPO_ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 install -m 644 "$REPO_ROOT/systemd/LG_Buddy.service" "$BUNDLE_DIR/systemd/LG_Buddy.service"
 install -m 644 "$REPO_ROOT/systemd/LG_Buddy_lifecycle.service" "$BUNDLE_DIR/systemd/LG_Buddy_lifecycle.service"
 install -m 644 "$REPO_ROOT/systemd/LG_Buddy_screen.service" "$BUNDLE_DIR/systemd/LG_Buddy_screen.service"
+install -m 644 "$REPO_ROOT/systemd/LG_Buddy_update_check.service" "$BUNDLE_DIR/systemd/LG_Buddy_update_check.service"
+install -m 644 "$REPO_ROOT/systemd/LG_Buddy_update_check.timer" "$BUNDLE_DIR/systemd/LG_Buddy_update_check.timer"
 install -m 644 "$REPO_ROOT/systemd/lg_buddy.conf" "$BUNDLE_DIR/systemd/lg_buddy.conf"
 cp -R "$REPO_ROOT/docs/." "$BUNDLE_DIR/docs/"
 

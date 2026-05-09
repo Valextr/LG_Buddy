@@ -273,7 +273,7 @@ Commands:
   lifecycle       Run the system lifecycle monitor loop
   detect-backend  Detect the active screen backend
   settings        Inspect and edit structured LG Buddy settings
-  updates         Check GitHub releases on demand
+  updates         Check GitHub releases on demand or from the user timer
 
 Startup modes:
   auto            Restore on wake when LG Buddy owns the system marker, otherwise boot
@@ -289,6 +289,7 @@ Settings:
 
 Updates:
   updates check [--channel stable|prerelease] [--notify]
+  updates background-check
 "
     )
 }
@@ -632,6 +633,12 @@ mod tests {
                 }
             )))
         );
+        assert_eq!(
+            parse_args(["updates", "background-check"]),
+            Ok(ParseOutcome::Command(Command::Updates(
+                UpdatesCommand::BackgroundCheck
+            )))
+        );
     }
 
     #[test]
@@ -746,6 +753,15 @@ mod tests {
             parse_args(["updates", "check", "--notify", "--notify"]),
             Err(ParseError::Updates(UpdatesParseError::DuplicateNotify))
         );
+        assert_eq!(
+            parse_args(["updates", "background-check", "extra"]),
+            Err(ParseError::Updates(
+                UpdatesParseError::UnexpectedArguments {
+                    subcommand: "background-check",
+                    arguments: vec!["extra".to_string()]
+                }
+            ))
+        );
     }
 
     #[test]
@@ -799,6 +815,7 @@ mod tests {
             "settings set <key> <value>",
             "settings unset <key>",
             "updates check [--channel stable|prerelease] [--notify]",
+            "updates background-check",
         ] {
             assert!(help.contains(command), "missing `{command}` from help");
         }

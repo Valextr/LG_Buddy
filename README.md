@@ -75,7 +75,7 @@ chmod +x ./install.sh
 ./install.sh
 ```
 
-The installer will prompt for your TV IP, MAC address, HDMI input, idle-monitor backend, idle timeout, and screen restore policy, then install the required services. System sleep/wake handling uses the default lifecycle service plus NetworkManager pre-down gate unless you opt out in `config.env`.
+The installer will prompt for your TV IP, MAC address, HDMI input, and session idle blanking details, then install the required services. System sleep/wake handling uses the default lifecycle service plus NetworkManager pre-down gate unless you opt out in `config.env`.
 
 On first use, you may need to accept a pairing prompt on the TV:
 
@@ -92,8 +92,10 @@ LG Buddy is mostly automatic after installation.
 - To inspect the installed runtime version, run `lg-buddy --version`
 - To check GitHub releases on demand, run `lg-buddy updates check`; add
   `--notify` to send a desktop notification when an update is available
+- Weekly background update checks are installed by default; opt out with
+  `lg-buddy settings set updates.auto_check disabled`
 - To rerun full setup for TV IP, MAC address, or HDMI input, run `./configure.sh`
-- To check the screen monitor, run `systemctl --user status LG_Buddy_screen.service`
+- To check the user-session service, run `systemctl --user status LG_Buddy_screen.service`
 - To remove LG Buddy, run `./uninstall.sh`
 
 The settings CLI is a structured layer over `config.env`. These examples write
@@ -102,10 +104,13 @@ the same file that manual editing and `configure.sh` use:
 ```bash
 lg-buddy settings describe tv.input
 lg-buddy settings set tv.input HDMI_2
+lg-buddy settings set screen.idle_blank disabled
 lg-buddy settings describe screen.restore_policy
 lg-buddy settings set screen.idle_timeout 600
 lg-buddy settings set screen.restore_policy aggressive
 lg-buddy settings set system.sleep_wake_policy disabled
+lg-buddy settings set updates.auto_check disabled
+lg-buddy settings set updates.channel prerelease
 lg-buddy settings unset screen.restore_policy
 ```
 
@@ -115,9 +120,13 @@ Settings can also be edited directly in `config.env`:
 tvs_primary_ip=192.168.1.100
 tvs_primary_mac=aa:bb:cc:dd:ee:ff
 tvs_primary_input=HDMI_2
+screen_idle_blank=enabled
+screen_backend=auto
 screen_idle_timeout=300
 screen_restore_policy=conservative
 system_sleep_wake_policy=enabled
+updates_auto_check=enabled
+updates_channel=stable
 ```
 
 `tv_ip`, `tv_mac`, and `input` are still accepted as legacy single-TV keys, but
@@ -136,10 +145,22 @@ Set `screen_restore_policy=aggressive` to let session wake/activity and system w
 
 `marker_only` is still accepted as a legacy alias for `conservative`.
 
+`screen_idle_blank=enabled` is the default. Set
+`screen_idle_blank=disabled` if you want the user-session service to stay
+available for update notifications without running idle-driven TV blank/restore
+behavior.
+
 `system_sleep_wake_policy=enabled` is the default. Set
 `system_sleep_wake_policy=disabled` if you do not want LG Buddy to control the
 TV around system sleep and wake. The lifecycle service and NetworkManager
 pre-down hook stay installed and no-op while the policy is disabled.
+
+`updates_auto_check=enabled` is the default. Set
+`updates_auto_check=disabled` if you do not want the installed user timer to
+check for updates and notify you when a release is available. Manual
+`lg-buddy updates check` commands still work when automatic checks are disabled.
+`updates_channel=stable` is the default for scheduled checks. Set it to
+`prerelease` to opt in to prerelease update notifications.
 
 ## More Help
 

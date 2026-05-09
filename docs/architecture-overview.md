@@ -75,6 +75,7 @@ flowchart LR
     subgraph SystemLifecycle["System Lifecycle"]
         LOGIND["logind system bus<br/>PrepareForSleep"]
         NM["NetworkManager dispatcher<br/>pre-down"]
+        UPDATE_TIMER["systemd user timer<br/>background update checks"]
     end
 
     subgraph TTY["TTY / CLI"]
@@ -201,6 +202,7 @@ The intended split is:
   - session-owned update notification dispatch through
     `org.freedesktop.Notifications`
   - update notification action handling for `View Release`
+  - hosted by the user-session `monitor` process
 - `screen.rs`
   - pure session screen blank and restore policy decisions over already-read
     observations
@@ -260,6 +262,9 @@ The intended split is:
   - system-bus use for the logind lifecycle runtime
 - `session/runner.rs`
   - backend-neutral monitor and lifecycle runners
+  - starts the user-session notification surface before screen backend work
+  - keeps the user-session process alive when idle blanking is disabled or a
+    screen backend is temporarily unavailable
   - combines backend observations with the inactivity engine
   - dispatches semantic session events into screen and lifecycle policy
   - runs delegated `swayidle` by invoking the current executable's
@@ -296,6 +301,8 @@ The session-facing pieces should be read as one subsystem:
   - see [gamepad-subsystem.md](gamepad-subsystem.md) for adapter and lifecycle details
 - `session/runner.rs`
   - consumes normalized session events and idletime observations and dispatches runtime policy
+  - treats `screen_idle_blank=disabled` as a passive user-session mode that
+    preserves update notification handoff without TV idle blank/restore actions
   - treats delegated `swayidle` as a CLI/API client for timeout/resume actions
   - owns the `lifecycle` event loop for system sleep/wake handling
 - `sources/linux/logind.rs`
@@ -324,20 +331,25 @@ The binary currently supports these commands:
 - `detect-backend`
 - `settings`
 - `updates check [--channel stable|prerelease] [--notify]`
+- `updates background-check`
 
 `lib.rs` parses the command line into a typed command enum and dispatches into
 the runtime command handlers in `commands.rs` and `session/runner.rs`.
 `commands.rs` then delegates screen and lifecycle decisions to their domain
 modules and delegates platform ingestion to `sources/`. The on-demand
 `updates check` command consumes the GitHub Releases API without entering the
-screen, lifecycle, settings, or scheduling paths. When `--notify` is passed and
-an update is available, the one-shot CLI process hands the resolved update facts
-to the LG Buddy-owned user-session D-Bus surface. The running session process
-then owns desktop notification dispatch, notification ids, and the `View
-Release` action. `updates check` owns an operational cache under the user cache
-directory for GitHub ETag, latest release metadata, and last-notified release
-state used by the observable update notification policy; that cache is not user
-configuration and is not part of the settings API.
+screen, lifecycle, settings, or scheduling paths. `updates background-check` is
+the timer-owned wrapper: it reads update settings, exits before GitHub/cache
+work when automatic checks are disabled, and otherwise delegates to the same
+update check path with notification intent enabled. When notification is
+requested and an update is available, the one-shot CLI process hands the
+resolved update facts to the LG Buddy-owned user-session D-Bus surface. The
+running session process then owns desktop notification dispatch, notification
+ids, and the `View Release` action. The update command owns an operational
+cache under the user cache directory for GitHub ETag, latest release metadata,
+and last-notified release state used by the observable update notification
+policy; that cache is not user configuration and is not part of the settings
+API.
 The `brightness get` and `brightness set` commands use the TV picture
 abstraction in `tv.rs` for typed OLED brightness validation and live TV
 read/write operations. The interactive brightness dialog delegates its TV

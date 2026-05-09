@@ -14,6 +14,7 @@ use crate::config::{
 
 const SETTINGS_SUBCOMMANDS: &[&str] = &["list", "describe", "get", "set", "unset"];
 const SCREEN_SERVICE_NAME: &str = "LG_Buddy_screen.service";
+const UPDATE_CHECK_TIMER_NAME: &str = "LG_Buddy_update_check.timer";
 
 const READ_WRITE_OPERATIONS: &[SettingOperation] = &[
     SettingOperation::Get,
@@ -38,8 +39,11 @@ const SCREEN_RESTORE_POLICY_ALIASES: &[SettingAlias] = &[SettingAlias {
 
 const TV_INPUT_VALUES: &[&str] = &["HDMI_1", "HDMI_2", "HDMI_3", "HDMI_4"];
 const SCREEN_BACKEND_VALUES: &[&str] = &["auto", "gnome", "swayidle"];
+const SCREEN_IDLE_BLANK_VALUES: &[&str] = &["enabled", "disabled"];
 const SCREEN_RESTORE_POLICY_VALUES: &[&str] = &["conservative", "aggressive"];
 const SYSTEM_SLEEP_WAKE_POLICY_VALUES: &[&str] = &["enabled", "disabled"];
+const UPDATE_AUTO_CHECK_VALUES: &[&str] = &["enabled", "disabled"];
+const UPDATE_CHANNEL_VALUES: &[&str] = &["stable", "prerelease"];
 
 const SETTING_DEFINITIONS: &[SettingDefinition] = &[
     SettingDefinition {
@@ -93,6 +97,20 @@ const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         description: "Screen backend selection for user-session blanking and restore behavior.",
     },
     SettingDefinition {
+        key: "screen.idle_blank",
+        storage_key: "screen_idle_blank",
+        fallback_storage_keys: EMPTY_STORAGE_KEYS,
+        value_type: SettingType::Enum(EnumSettingType {
+            values: SCREEN_IDLE_BLANK_VALUES,
+            aliases: EMPTY_ALIASES,
+        }),
+        default_value: Some(SettingValue::Enum("enabled")),
+        mutability: SettingMutability::ReadWrite,
+        operations: READ_WRITE_OPERATIONS,
+        apply_strategy: ApplyStrategy::RestartUserScreenService,
+        description: "Idle-driven blanking and restore behavior for the configured screen.",
+    },
+    SettingDefinition {
         key: "screen.idle_timeout",
         storage_key: "screen_idle_timeout",
         fallback_storage_keys: EMPTY_STORAGE_KEYS,
@@ -133,6 +151,34 @@ const SETTING_DEFINITIONS: &[SettingDefinition] = &[
         operations: READ_WRITE_OPERATIONS,
         apply_strategy: ApplyStrategy::RuntimePolicyOnly,
         description: "System sleep and wake policy for lifecycle hooks.",
+    },
+    SettingDefinition {
+        key: "updates.auto_check",
+        storage_key: "updates_auto_check",
+        fallback_storage_keys: EMPTY_STORAGE_KEYS,
+        value_type: SettingType::Enum(EnumSettingType {
+            values: UPDATE_AUTO_CHECK_VALUES,
+            aliases: EMPTY_ALIASES,
+        }),
+        default_value: Some(SettingValue::Enum("enabled")),
+        mutability: SettingMutability::ReadWrite,
+        operations: READ_WRITE_OPERATIONS,
+        apply_strategy: ApplyStrategy::ManageUpdateCheckTimer,
+        description: "Automatic background update checks and update notifications.",
+    },
+    SettingDefinition {
+        key: "updates.channel",
+        storage_key: "updates_channel",
+        fallback_storage_keys: EMPTY_STORAGE_KEYS,
+        value_type: SettingType::Enum(EnumSettingType {
+            values: UPDATE_CHANNEL_VALUES,
+            aliases: EMPTY_ALIASES,
+        }),
+        default_value: Some(SettingValue::Enum("stable")),
+        mutability: SettingMutability::ReadWrite,
+        operations: READ_WRITE_OPERATIONS,
+        apply_strategy: ApplyStrategy::RuntimePolicyOnly,
+        description: "Release channel used by automatic background update checks.",
     },
 ];
 
@@ -657,6 +703,9 @@ impl SettingsChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsApplyOutcome {
     Restarted { service: &'static str },
+    Enabled { unit: &'static str },
+    EnabledStarted { unit: &'static str },
+    DisabledStopped { unit: &'static str },
     NotInstalled { service: &'static str },
     InactiveDisabled { service: &'static str },
     Skipped { reason: String },
@@ -667,6 +716,9 @@ impl fmt::Display for SettingsApplyOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Restarted { service } => write!(f, "restarted {service}"),
+            Self::Enabled { unit } => write!(f, "enabled {unit}"),
+            Self::EnabledStarted { unit } => write!(f, "enabled and started {unit}"),
+            Self::DisabledStopped { unit } => write!(f, "disabled and stopped {unit}"),
             Self::NotInstalled { service } => {
                 write!(
                     f,
@@ -690,6 +742,12 @@ pub enum UserServiceState {
     ActiveOrEnabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserUnitEnableOutcome {
+    Enabled,
+    EnabledStarted,
+}
+
 pub trait ServiceController {
     fn systemd_actions_disabled(&self) -> bool {
         false
@@ -698,6 +756,10 @@ pub trait ServiceController {
     fn user_service_state(&self, service: &str) -> Result<UserServiceState, SettingsError>;
 
     fn restart_user_service(&self, service: &str) -> Result<(), SettingsError>;
+
+    fn enable_start_user_unit(&self, unit: &str) -> Result<UserUnitEnableOutcome, SettingsError>;
+
+    fn disable_stop_user_unit(&self, unit: &str) -> Result<(), SettingsError>;
 }
 
 #[derive(Debug, Clone)]
@@ -731,6 +793,28 @@ impl SystemdUserServiceController {
             .status()
             .map(|status| status.success())
     }
+
+    fn run_user_systemctl(&self, args: &[&str]) -> Result<(), SettingsError> {
+        let output = ProcessCommand::new(&self.command_path)
+            .arg("--user")
+            .args(args)
+            .output()
+            .map_err(|err| SettingsError::Apply {
+                message: format!("could not run systemctl: {err}"),
+            })?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(SettingsError::Apply {
+                message: format_command_failure(
+                    output.status.code(),
+                    &output.stdout,
+                    &output.stderr,
+                ),
+            })
+        }
+    }
 }
 
 impl ServiceController for SystemdUserServiceController {
@@ -761,26 +845,24 @@ impl ServiceController for SystemdUserServiceController {
     }
 
     fn restart_user_service(&self, service: &str) -> Result<(), SettingsError> {
-        let output = ProcessCommand::new(&self.command_path)
-            .arg("--user")
-            .arg("restart")
-            .arg(service)
-            .output()
-            .map_err(|err| SettingsError::Apply {
-                message: format!("could not run systemctl: {err}"),
-            })?;
+        self.run_user_systemctl(&["restart", service])
+    }
 
-        if output.status.success() {
-            Ok(())
+    fn enable_start_user_unit(&self, unit: &str) -> Result<UserUnitEnableOutcome, SettingsError> {
+        self.run_user_systemctl(&["enable", unit])?;
+        if self
+            .user_systemctl_status(&["is-active", "--quiet", "graphical-session.target"])
+            .unwrap_or(false)
+        {
+            self.run_user_systemctl(&["start", unit])?;
+            Ok(UserUnitEnableOutcome::EnabledStarted)
         } else {
-            Err(SettingsError::Apply {
-                message: format_command_failure(
-                    output.status.code(),
-                    &output.stdout,
-                    &output.stderr,
-                ),
-            })
+            Ok(UserUnitEnableOutcome::Enabled)
         }
+    }
+
+    fn disable_stop_user_unit(&self, unit: &str) -> Result<(), SettingsError> {
+        self.run_user_systemctl(&["disable", "--now", unit])
     }
 }
 
@@ -805,6 +887,7 @@ impl<C: ServiceController> SettingsApplier<C> {
     pub fn apply(&self, change: &SettingsChange) -> Result<SettingsApplyOutcome, SettingsError> {
         match change.mutation().definition().apply_strategy() {
             ApplyStrategy::RestartUserScreenService => self.apply_screen_service_restart(),
+            ApplyStrategy::ManageUpdateCheckTimer => self.apply_update_check_timer(change),
             ApplyStrategy::RuntimePolicyOnly | ApplyStrategy::NoRuntimeApplyRequired => {
                 Ok(SettingsApplyOutcome::NoActionRequired)
             }
@@ -836,6 +919,74 @@ impl<C: ServiceController> SettingsApplier<C> {
                 })
             }
         }
+    }
+
+    fn apply_update_check_timer(
+        &self,
+        change: &SettingsChange,
+    ) -> Result<SettingsApplyOutcome, SettingsError> {
+        if self.service_controller.systemd_actions_disabled() {
+            return Ok(SettingsApplyOutcome::Skipped {
+                reason: "skipped systemd apply because LG_BUDDY_SKIP_SYSTEMD_ACTIONS=1".to_string(),
+            });
+        }
+
+        let enabled = match change.mutation().new_value()?.as_enum() {
+            Some("enabled") => true,
+            Some("disabled") => false,
+            _ => {
+                return Err(SettingsError::Apply {
+                    message: "updates.auto_check resolved to an invalid value".to_string(),
+                });
+            }
+        };
+
+        match self
+            .service_controller
+            .user_service_state(UPDATE_CHECK_TIMER_NAME)?
+        {
+            UserServiceState::Missing => Ok(SettingsApplyOutcome::NotInstalled {
+                service: UPDATE_CHECK_TIMER_NAME,
+            }),
+            UserServiceState::InactiveDisabled => {
+                if enabled {
+                    let outcome = self
+                        .service_controller
+                        .enable_start_user_unit(UPDATE_CHECK_TIMER_NAME)?;
+                    Ok(settings_enable_outcome(UPDATE_CHECK_TIMER_NAME, outcome))
+                } else {
+                    self.service_controller
+                        .disable_stop_user_unit(UPDATE_CHECK_TIMER_NAME)?;
+                    Ok(SettingsApplyOutcome::DisabledStopped {
+                        unit: UPDATE_CHECK_TIMER_NAME,
+                    })
+                }
+            }
+            UserServiceState::ActiveOrEnabled => {
+                if enabled {
+                    let outcome = self
+                        .service_controller
+                        .enable_start_user_unit(UPDATE_CHECK_TIMER_NAME)?;
+                    Ok(settings_enable_outcome(UPDATE_CHECK_TIMER_NAME, outcome))
+                } else {
+                    self.service_controller
+                        .disable_stop_user_unit(UPDATE_CHECK_TIMER_NAME)?;
+                    Ok(SettingsApplyOutcome::DisabledStopped {
+                        unit: UPDATE_CHECK_TIMER_NAME,
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn settings_enable_outcome(
+    unit: &'static str,
+    outcome: UserUnitEnableOutcome,
+) -> SettingsApplyOutcome {
+    match outcome {
+        UserUnitEnableOutcome::Enabled => SettingsApplyOutcome::Enabled { unit },
+        UserUnitEnableOutcome::EnabledStarted => SettingsApplyOutcome::EnabledStarted { unit },
     }
 }
 
@@ -1783,6 +1934,7 @@ impl fmt::Display for SettingOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyStrategy {
     RestartUserScreenService,
+    ManageUpdateCheckTimer,
     RuntimePolicyOnly,
     NoRuntimeApplyRequired,
 }
@@ -1791,6 +1943,7 @@ impl ApplyStrategy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RestartUserScreenService => "restart-user-screen-service",
+            Self::ManageUpdateCheckTimer => "manage-update-check-timer",
             Self::RuntimePolicyOnly => "runtime-policy-only",
             Self::NoRuntimeApplyRequired => "no-runtime-apply-required",
         }
@@ -2073,7 +2226,8 @@ mod tests {
         format_effective_value, ApplyStrategy, ConfigEnvReader, ConfigPathResolver,
         ServiceController, SettingKey, SettingMutability, SettingOperation, SettingSource,
         SettingType, SettingValue, SettingsApplier, SettingsCommand, SettingsCommandRunner,
-        SettingsError, SettingsParseError, SettingsStore, UserServiceState, SETTINGS_REGISTRY,
+        SettingsError, SettingsParseError, SettingsStore, UserServiceState, UserUnitEnableOutcome,
+        SETTINGS_REGISTRY,
     };
     use crate::config::{ConfigPathSources, MAX_IDLE_TIMEOUT};
     use std::cell::Cell;
@@ -2102,9 +2256,12 @@ mod tests {
                 "tv.mac",
                 "tv.input",
                 "screen.backend",
+                "screen.idle_blank",
                 "screen.idle_timeout",
                 "screen.restore_policy",
                 "system.sleep_wake_policy",
+                "updates.auto_check",
+                "updates.channel",
             ]
         );
     }
@@ -2124,9 +2281,12 @@ mod tests {
                 ("tv.mac", "tvs_primary_mac"),
                 ("tv.input", "tvs_primary_input"),
                 ("screen.backend", "screen_backend"),
+                ("screen.idle_blank", "screen_idle_blank"),
                 ("screen.idle_timeout", "screen_idle_timeout"),
                 ("screen.restore_policy", "screen_restore_policy"),
                 ("system.sleep_wake_policy", "system_sleep_wake_policy"),
+                ("updates.auto_check", "updates_auto_check"),
+                ("updates.channel", "updates_channel"),
             ]
         );
     }
@@ -2146,9 +2306,12 @@ mod tests {
                 "tv.mac | storage=tvs_primary_mac | fallbacks=tv_mac | type=mac-address | default=required | mutability=read-write | ops=get,describe,set | apply=no-runtime-apply-required | description=MAC address of the primary configured TV for Wake-on-LAN.",
                 "tv.input | storage=tvs_primary_input | fallbacks=input | type=enum values=HDMI_1,HDMI_2,HDMI_3,HDMI_4 aliases=(none) | default=required | mutability=read-write | ops=get,describe,set | apply=no-runtime-apply-required | description=HDMI input used by the primary configured TV.",
                 "screen.backend | storage=screen_backend | fallbacks=(none) | type=enum values=auto,gnome,swayidle aliases=(none) | default=auto | mutability=read-write | ops=get,describe,set,unset | apply=restart-user-screen-service | description=Screen backend selection for user-session blanking and restore behavior.",
+                "screen.idle_blank | storage=screen_idle_blank | fallbacks=(none) | type=enum values=enabled,disabled aliases=(none) | default=enabled | mutability=read-write | ops=get,describe,set,unset | apply=restart-user-screen-service | description=Idle-driven blanking and restore behavior for the configured screen.",
                 "screen.idle_timeout | storage=screen_idle_timeout | fallbacks=(none) | type=integer range=1..=86400 | default=300 | mutability=read-write | ops=get,describe,set,unset | apply=restart-user-screen-service | description=Idle timeout in seconds before LG Buddy blanks the configured screen.",
                 "screen.restore_policy | storage=screen_restore_policy | fallbacks=(none) | type=enum values=conservative,aggressive aliases=marker_only->conservative | default=conservative | mutability=read-write | ops=get,describe,set,unset | apply=restart-user-screen-service | description=Screen restore policy after LG Buddy blanks the configured screen.",
                 "system.sleep_wake_policy | storage=system_sleep_wake_policy | fallbacks=(none) | type=enum values=enabled,disabled aliases=(none) | default=enabled | mutability=read-write | ops=get,describe,set,unset | apply=runtime-policy-only | description=System sleep and wake policy for lifecycle hooks.",
+                "updates.auto_check | storage=updates_auto_check | fallbacks=(none) | type=enum values=enabled,disabled aliases=(none) | default=enabled | mutability=read-write | ops=get,describe,set,unset | apply=manage-update-check-timer | description=Automatic background update checks and update notifications.",
+                "updates.channel | storage=updates_channel | fallbacks=(none) | type=enum values=stable,prerelease aliases=(none) | default=stable | mutability=read-write | ops=get,describe,set,unset | apply=runtime-policy-only | description=Release channel used by automatic background update checks.",
             ]
         );
     }
@@ -2233,9 +2396,12 @@ tv.ip=<missing> (missing, read-write, ops: get,describe,set)
 tv.mac=<missing> (missing, read-write, ops: get,describe,set)
 tv.input=<missing> (missing, read-write, ops: get,describe,set)
 screen.backend=gnome (config.env, read-write, ops: get,describe,set,unset)
+screen.idle_blank=enabled (default, read-write, ops: get,describe,set,unset)
 screen.idle_timeout=300 (default, read-write, ops: get,describe,set,unset)
 screen.restore_policy=conservative (default, read-write, ops: get,describe,set,unset)
 system.sleep_wake_policy=disabled (config.env, read-write, ops: get,describe,set,unset)
+updates.auto_check=enabled (default, read-write, ops: get,describe,set,unset)
+updates.channel=stable (default, read-write, ops: get,describe,set,unset)
 "
         );
     }
@@ -2346,6 +2512,18 @@ screen.backend
   apply: restart-user-screen-service
   description: Screen backend selection for user-session blanking and restore behavior.
 
+screen.idle_blank
+  storage key: screen_idle_blank
+  type: enum
+  current: enabled
+  source: default
+  default: enabled
+  mutability: read-write
+  supported operations: get, describe, set, unset
+  allowed values: enabled, disabled
+  apply: restart-user-screen-service
+  description: Idle-driven blanking and restore behavior for the configured screen.
+
 screen.idle_timeout
   storage key: screen_idle_timeout
   type: integer
@@ -2382,6 +2560,30 @@ system.sleep_wake_policy
   allowed values: enabled, disabled
   apply: runtime-policy-only
   description: System sleep and wake policy for lifecycle hooks.
+
+updates.auto_check
+  storage key: updates_auto_check
+  type: enum
+  current: enabled
+  source: default
+  default: enabled
+  mutability: read-write
+  supported operations: get, describe, set, unset
+  allowed values: enabled, disabled
+  apply: manage-update-check-timer
+  description: Automatic background update checks and update notifications.
+
+updates.channel
+  storage key: updates_channel
+  type: enum
+  current: stable
+  source: default
+  default: stable
+  mutability: read-write
+  supported operations: get, describe, set, unset
+  allowed values: stable, prerelease
+  apply: runtime-policy-only
+  description: Release channel used by automatic background update checks.
 "
         );
     }
@@ -2693,6 +2895,167 @@ screen_restore_policy=aggressive
     }
 
     #[test]
+    fn settings_runner_disables_update_timer_when_auto_check_is_disabled() {
+        let path = unique_test_path("disable-update-checks");
+        fs::write(&path, "updates_auto_check=enabled\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let fake_service = FakeServiceController::active_or_enabled();
+        let disables = fake_service.disables.clone();
+        let runner = SettingsCommandRunner::with_applier(store, SettingsApplier::new(fake_service));
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Set {
+                    key: "updates.auto_check".to_string(),
+                    value: "disabled".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "updates_auto_check=disabled\n"
+        );
+        assert_eq!(disables.get(), 1);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("updates.auto_check=disabled (saved to "));
+        assert!(output.contains("apply: disabled and stopped LG_Buddy_update_check.timer\n"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_enables_update_timer_when_auto_check_is_enabled() {
+        let path = unique_test_path("enable-update-checks");
+        fs::write(&path, "updates_auto_check=disabled\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let fake_service = FakeServiceController::inactive_disabled();
+        let enables = fake_service.enables.clone();
+        let runner = SettingsCommandRunner::with_applier(store, SettingsApplier::new(fake_service));
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Set {
+                    key: "updates.auto_check".to_string(),
+                    value: "enabled".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "updates_auto_check=enabled\n"
+        );
+        assert_eq!(enables.get(), 1);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("updates.auto_check=enabled (saved to "));
+        assert!(output.contains("apply: enabled and started LG_Buddy_update_check.timer\n"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_reports_missing_update_timer_after_persisting_auto_check() {
+        let path = unique_test_path("missing-update-check-timer");
+        fs::write(&path, "updates_auto_check=enabled\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::missing()),
+        );
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Set {
+                    key: "updates.auto_check".to_string(),
+                    value: "disabled".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "updates_auto_check=disabled\n"
+        );
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("apply: LG_Buddy_update_check.timer is not installed"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_skips_update_timer_apply_when_systemd_actions_are_disabled() {
+        let path = unique_test_path("skip-update-timer-apply");
+        fs::write(&path, "updates_auto_check=enabled\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let mut fake_service = FakeServiceController::active_or_enabled();
+        fake_service.skip_actions = true;
+        let disables = fake_service.disables.clone();
+        let runner = SettingsCommandRunner::with_applier(store, SettingsApplier::new(fake_service));
+        let mut output = Vec::new();
+
+        runner
+            .run(
+                SettingsCommand::Set {
+                    key: "updates.auto_check".to_string(),
+                    value: "disabled".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "updates_auto_check=disabled\n"
+        );
+        assert_eq!(disables.get(), 0);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("apply: skipped systemd apply"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_runner_reports_update_timer_apply_failure_after_persisting_value() {
+        let path = unique_test_path("update-timer-apply-fail");
+        fs::write(&path, "updates_auto_check=enabled\n").unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        let runner = SettingsCommandRunner::with_applier(
+            store,
+            SettingsApplier::new(FakeServiceController::failing_unit_action()),
+        );
+        let mut output = Vec::new();
+
+        let err = runner
+            .run(
+                SettingsCommand::Set {
+                    key: "updates.auto_check".to_string(),
+                    value: "disabled".to_string(),
+                },
+                &mut output,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "updates_auto_check=disabled\n"
+        );
+        assert!(matches!(err, SettingsError::ApplyAfterPersist { .. }));
+        assert!(err.to_string().contains("was saved"));
+        assert!(output.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn settings_runner_sets_tv_value_to_canonical_storage_without_restart() {
         let path = unique_test_path("tv-set");
         fs::write(
@@ -2833,6 +3196,7 @@ tvs_primary_ip=192.0.2.43
             "/tmp/config.env",
             "\
             screen_backend=gnome
+            screen_idle_blank=disabled
             screen_idle_timeout=450
             screen_restore_policy=aggressive
             system_sleep_wake_policy=disabled
@@ -2843,6 +3207,10 @@ tvs_primary_ip=192.0.2.43
         let backend = store.effective_by_name("screen.backend").unwrap();
         assert_eq!(backend.value(), Some(SettingValue::Enum("gnome")));
         assert_eq!(backend.source(), SettingSource::ConfigEnv);
+
+        let idle_blank = store.effective_by_name("screen.idle_blank").unwrap();
+        assert_eq!(idle_blank.value(), Some(SettingValue::Enum("disabled")));
+        assert_eq!(idle_blank.source(), SettingSource::ConfigEnv);
 
         let idle_timeout = store.effective_by_name("screen.idle_timeout").unwrap();
         assert_eq!(idle_timeout.value(), Some(SettingValue::Integer(450)));
@@ -2923,6 +3291,7 @@ tvs_primary_ip=192.0.2.43
             "/tmp/config.env",
             "\
             screen_backend=not-a-backend
+            screen_idle_blank=not-a-policy
             screen_idle_timeout=not-a-number
             screen_restore_policy=not-a-policy
             ",
@@ -2933,6 +3302,11 @@ tvs_primary_ip=192.0.2.43
         assert_eq!(backend.value(), None);
         assert_eq!(backend.source(), SettingSource::InvalidConfigEnv);
         assert_eq!(backend.invalid_value(), Some("not-a-backend"));
+
+        let idle_blank = store.effective_by_name("screen.idle_blank").unwrap();
+        assert_eq!(idle_blank.value(), None);
+        assert_eq!(idle_blank.source(), SettingSource::InvalidConfigEnv);
+        assert_eq!(idle_blank.invalid_value(), Some("not-a-policy"));
 
         let idle_timeout = store.effective_by_name("screen.idle_timeout").unwrap();
         assert_eq!(idle_timeout.value(), None);
@@ -3055,9 +3429,12 @@ tvs_primary_ip=192.0.2.43
                 "tv.mac",
                 "tv.input",
                 "screen.backend",
+                "screen.idle_blank",
                 "screen.idle_timeout",
                 "screen.restore_policy",
                 "system.sleep_wake_policy",
+                "updates.auto_check",
+                "updates.channel",
             ]
         );
         assert_eq!(
@@ -3067,9 +3444,12 @@ tvs_primary_ip=192.0.2.43
                 "<missing>",
                 "<missing>",
                 "gnome",
+                "enabled",
                 "300",
                 "conservative",
                 "disabled",
+                "enabled",
+                "stable",
             ]
         );
         assert_eq!(
@@ -3081,7 +3461,10 @@ tvs_primary_ip=192.0.2.43
                 SettingSource::ConfigEnv,
                 SettingSource::Default,
                 SettingSource::Default,
+                SettingSource::Default,
                 SettingSource::ConfigEnv,
+                SettingSource::Default,
+                SettingSource::Default,
             ]
         );
     }
@@ -3090,8 +3473,12 @@ tvs_primary_ip=192.0.2.43
     fn key_parser_accepts_supported_dotted_names() {
         for key in [
             "screen.backend",
+            "screen.idle_blank",
             "screen.idle_timeout",
+            "screen.restore_policy",
             "system.sleep_wake_policy",
+            "updates.auto_check",
+            "updates.channel",
         ] {
             assert_eq!(SettingKey::parse(key).unwrap().as_str(), key);
         }
@@ -3292,6 +3679,20 @@ tvs_primary_ip=192.0.2.43
             sleep_policy.apply_strategy(),
             ApplyStrategy::RuntimePolicyOnly
         );
+
+        let auto_check = SETTINGS_REGISTRY.get_by_name("updates.auto_check").unwrap();
+        assert!(matches!(auto_check.value_type(), SettingType::Enum(_)));
+        assert_eq!(
+            auto_check.apply_strategy(),
+            ApplyStrategy::ManageUpdateCheckTimer
+        );
+
+        let update_channel = SETTINGS_REGISTRY.get_by_name("updates.channel").unwrap();
+        assert!(matches!(update_channel.value_type(), SettingType::Enum(_)));
+        assert_eq!(
+            update_channel.apply_strategy(),
+            ApplyStrategy::RuntimePolicyOnly
+        );
     }
 
     fn unique_test_path(name: &str) -> PathBuf {
@@ -3372,7 +3773,10 @@ tvs_primary_ip=192.0.2.43
     struct FakeServiceController {
         state: UserServiceState,
         restarts: Rc<Cell<usize>>,
+        enables: Rc<Cell<usize>>,
+        disables: Rc<Cell<usize>>,
         restart_error: Option<&'static str>,
+        unit_action_error: Option<&'static str>,
         skip_actions: bool,
     }
 
@@ -3381,7 +3785,10 @@ tvs_primary_ip=192.0.2.43
             Self {
                 state: UserServiceState::ActiveOrEnabled,
                 restarts: Rc::new(Cell::new(0)),
+                enables: Rc::new(Cell::new(0)),
+                disables: Rc::new(Cell::new(0)),
                 restart_error: None,
+                unit_action_error: None,
                 skip_actions: false,
             }
         }
@@ -3390,7 +3797,10 @@ tvs_primary_ip=192.0.2.43
             Self {
                 state: UserServiceState::InactiveDisabled,
                 restarts: Rc::new(Cell::new(0)),
+                enables: Rc::new(Cell::new(0)),
+                disables: Rc::new(Cell::new(0)),
                 restart_error: None,
+                unit_action_error: None,
                 skip_actions: false,
             }
         }
@@ -3399,7 +3809,10 @@ tvs_primary_ip=192.0.2.43
             Self {
                 state: UserServiceState::Missing,
                 restarts: Rc::new(Cell::new(0)),
+                enables: Rc::new(Cell::new(0)),
+                disables: Rc::new(Cell::new(0)),
                 restart_error: None,
+                unit_action_error: None,
                 skip_actions: false,
             }
         }
@@ -3408,7 +3821,22 @@ tvs_primary_ip=192.0.2.43
             Self {
                 state: UserServiceState::ActiveOrEnabled,
                 restarts: Rc::new(Cell::new(0)),
+                enables: Rc::new(Cell::new(0)),
+                disables: Rc::new(Cell::new(0)),
                 restart_error: Some("restart failed"),
+                unit_action_error: None,
+                skip_actions: false,
+            }
+        }
+
+        fn failing_unit_action() -> Self {
+            Self {
+                state: UserServiceState::ActiveOrEnabled,
+                restarts: Rc::new(Cell::new(0)),
+                enables: Rc::new(Cell::new(0)),
+                disables: Rc::new(Cell::new(0)),
+                restart_error: None,
+                unit_action_error: Some("unit action failed"),
                 skip_actions: false,
             }
         }
@@ -3427,6 +3855,33 @@ tvs_primary_ip=192.0.2.43
             self.restarts.set(self.restarts.get() + 1);
 
             if let Some(message) = self.restart_error {
+                Err(SettingsError::Apply {
+                    message: message.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn enable_start_user_unit(
+            &self,
+            _unit: &str,
+        ) -> Result<UserUnitEnableOutcome, SettingsError> {
+            self.enables.set(self.enables.get() + 1);
+
+            if let Some(message) = self.unit_action_error {
+                Err(SettingsError::Apply {
+                    message: message.to_string(),
+                })
+            } else {
+                Ok(UserUnitEnableOutcome::EnabledStarted)
+            }
+        }
+
+        fn disable_stop_user_unit(&self, _unit: &str) -> Result<(), SettingsError> {
+            self.disables.set(self.disables.get() + 1);
+
+            if let Some(message) = self.unit_action_error {
                 Err(SettingsError::Apply {
                     message: message.to_string(),
                 })

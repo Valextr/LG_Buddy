@@ -1,0 +1,8 @@
+[Unit]
+Description=LG Buddy background update check
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/lg-buddy updates background-check

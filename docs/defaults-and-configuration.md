@@ -77,7 +77,10 @@ tvs_primary_ip=192.168.1.100
 tvs_primary_mac=aa:bb:cc:dd:ee:ff
 tvs_primary_input=HDMI_2
 screen_restore_policy=conservative
+screen_idle_blank=enabled
 system_sleep_wake_policy=enabled
+updates_auto_check=enabled
+updates_channel=stable
 ```
 
 Avoid adding installer-only state for product behavior. Environment variables
@@ -111,6 +114,15 @@ choice.
 - it is writeable through `lg-buddy settings set screen.restore_policy <value>`
   because the command can apply screen-monitor changes
 
+`screen_idle_blank` follows the same policy model:
+
+- automatic session idle blank/restore defaults to enabled
+- users who want update notifications without idle-driven TV control can set
+  `screen_idle_blank=disabled`
+- the installed user-session service still runs so notification handoff remains
+  available
+- the supported values are `enabled` and `disabled`
+
 `system_sleep_wake_policy` follows the same model:
 
 - automatic system sleep/wake handling should default to enabled
@@ -121,3 +133,22 @@ choice.
 - the supported values are `enabled` and `disabled`
 - lifecycle service and NetworkManager hook installation are integration
   topology, while this setting controls runtime policy
+
+`updates_auto_check` follows the same opt-out model:
+
+- automatic update checks should default to enabled
+- background checks should be low-frequency, currently weekly with randomized
+  delay
+- the installer should not ask every user whether update checks should run
+- users who do not want background checks should opt out through `config.env` or
+  `lg-buddy settings set updates.auto_check disabled`
+- disabling automatic checks disables/stops the user timer instead of merely
+  suppressing notifications after doing the work
+
+`updates_channel` keeps scheduled update checks configurable without changing
+manual diagnostics:
+
+- `stable` is the default scheduled-check channel
+- `prerelease` is an explicit opt-in scheduled-check channel
+- manual `lg-buddy updates check --channel ...` still overrides channel for
+  that invocation only
