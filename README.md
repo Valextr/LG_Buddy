@@ -159,6 +159,9 @@ pre-down hook stay installed and no-op while the policy is disabled.
 `updates_auto_check=disabled` if you do not want the installed user timer to
 check for updates and notify you when a release is available. Manual
 `lg-buddy updates check` commands still work when automatic checks are disabled.
+Update notifications also include a `Never Notify Again` button when the
+desktop notification service supports actions; it disables automatic update
+checks through the same setting.
 `updates_channel=stable` is the default for scheduled checks. Set it to
 `prerelease` to opt in to prerelease update notifications.
 

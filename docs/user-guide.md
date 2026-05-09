@@ -60,8 +60,10 @@ check finds an available update. Notification delivery is handled by the
 running user-session LG Buddy process; if that process is not running,
 `--notify` reports a notification failure after printing the update result. When
 the desktop notification service supports actions, the notification includes a
-`View Release` button that opens the GitHub release page through the system
-opener. After a notification is delivered for a release, repeated `--notify`
+`Never Notify Again` button that sets `updates.auto_check=disabled` and
+disables the installed update-check timer, plus a `View Release` button that
+opens the GitHub release page through the system opener.
+After a notification is delivered for a release, repeated `--notify`
 checks for the same release skip the notification and print the notification
 policy decision; a newer release can notify again.
 `updates background-check` is the service-owned path used by the installed user

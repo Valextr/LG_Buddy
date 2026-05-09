@@ -201,7 +201,8 @@ The intended split is:
   - LG Buddy-owned user-session D-Bus surface for update notification handoff
   - session-owned update notification dispatch through
     `org.freedesktop.Notifications`
-  - update notification action handling for `View Release`
+  - update notification action handling for `View Release` and automatic
+    update-check opt-out
   - hosted by the user-session `monitor` process
 - `screen.rs`
   - pure session screen blank and restore policy decisions over already-read
@@ -345,11 +346,13 @@ update check path with notification intent enabled. When notification is
 requested and an update is available, the one-shot CLI process hands the
 resolved update facts to the LG Buddy-owned user-session D-Bus surface. The
 running session process then owns desktop notification dispatch, notification
-ids, and the `View Release` action. The update command owns an operational
-cache under the user cache directory for GitHub ETag, latest release metadata,
-and last-notified release state used by the observable update notification
-policy; that cache is not user configuration and is not part of the settings
-API.
+ids, the `View Release` action, and the notification opt-out action. The
+opt-out action persists `updates.auto_check=disabled` through the settings API,
+which also disables/stops the installed update-check timer. The update command
+owns an operational cache under the user cache directory for GitHub ETag,
+latest release metadata, and last-notified release state used by the observable
+update notification policy; that cache is not user configuration and is not
+part of the settings API.
 The `brightness get` and `brightness set` commands use the TV picture
 abstraction in `tv.rs` for typed OLED brightness validation and live TV
 read/write operations. The interactive brightness dialog delegates its TV

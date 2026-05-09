@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -24,8 +24,12 @@ use crate::notifications::{
     NOTIFICATION_PATH, NOTIFICATION_SERVICE,
 };
 use crate::session_bus::{
-    bus_signal_from_dbus_message, SessionBusError, DBUS_INTERFACE, DBUS_OBJECT_PATH,
-    DBUS_SERVICE_NAME,
+    bus_signal_from_dbus_message, new_session_bus_client, BusMethodCall, BusValue,
+    SessionBusClient, SessionBusError, DBUS_INTERFACE, DBUS_OBJECT_PATH, DBUS_SERVICE_NAME,
+};
+use crate::settings::{
+    run_settings_command, ConfigPathResolver, SettingsCommand, SettingsCommandRunner,
+    SettingsError, SettingsStore,
 };
 use crate::updates::UpdateChannel;
 use crate::version::ReleaseChannel;
@@ -35,10 +39,13 @@ pub(crate) const SESSION_OBJECT_PATH: &str = "/io/github/Staphylococcus/LGBuddy/
 pub(crate) const SESSION_INTERFACE: &str = "io.github.Staphylococcus.LGBuddy.Session1";
 pub(crate) const SHOW_UPDATE_NOTIFICATION_METHOD: &str = "ShowUpdateNotification";
 pub(crate) const VIEW_RELEASE_ACTION_KEY: &str = "view-release";
+pub(crate) const DISABLE_UPDATE_CHECKS_ACTION_KEY: &str = "disable-update-checks";
 
 const SESSION_PROCESS_INTERVAL: Duration = Duration::from_millis(50);
 const SESSION_START_TIMEOUT: Duration = Duration::from_secs(2);
 const NOTIFICATION_OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
+const RECENTLY_CLOSED_NOTIFICATION_LIMIT: usize = 16;
+const GNOME_SHELL_BUS_NAME: &str = "org.gnome.Shell";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UpdateNotificationRequest {
@@ -105,6 +112,38 @@ impl UpdateNotificationRequest {
         )
     }
 
+    fn to_bus_body(&self) -> Vec<BusValue> {
+        let (check_channel, current_version, current_channel, latest_version, latest_channel, url) =
+            self.to_dbus_fields();
+        vec![
+            BusValue::String(check_channel),
+            BusValue::String(current_version),
+            BusValue::String(current_channel),
+            BusValue::String(latest_version),
+            BusValue::String(latest_channel),
+            BusValue::String(url),
+        ]
+    }
+
+    fn from_bus_body(body: &[BusValue]) -> Result<Self, UpdateNotificationError> {
+        let [BusValue::String(check_channel), BusValue::String(current_version), BusValue::String(current_channel), BusValue::String(latest_version), BusValue::String(latest_channel), BusValue::String(release_url)] =
+            body
+        else {
+            return Err(UpdateNotificationError::InvalidRequest(
+                "expected D-Bus update notification body with 6 string fields".to_string(),
+            ));
+        };
+
+        Self::from_dbus_fields(
+            check_channel.clone(),
+            current_version.clone(),
+            current_channel.clone(),
+            latest_version.clone(),
+            latest_channel.clone(),
+            release_url.clone(),
+        )
+    }
+
     pub(crate) fn release_url(&self) -> &str {
         &self.release_url
     }
@@ -123,10 +162,16 @@ impl UpdateNotificationRequest {
         );
 
         if actions_supported {
-            notification.actions = vec![NotificationAction {
-                key: VIEW_RELEASE_ACTION_KEY.to_string(),
-                label: "View Release".to_string(),
-            }];
+            notification.actions = vec![
+                NotificationAction {
+                    key: DISABLE_UPDATE_CHECKS_ACTION_KEY.to_string(),
+                    label: "Never Notify Again".to_string(),
+                },
+                NotificationAction {
+                    key: VIEW_RELEASE_ACTION_KEY.to_string(),
+                    label: "View Release".to_string(),
+                },
+            ];
         }
 
         notification
@@ -193,6 +238,7 @@ pub enum UpdateNotificationError {
     Transport(String),
     Notification(NotificationError),
     Session(SessionServiceError),
+    Settings(SettingsError),
     OpenRelease { url: String, message: String },
 }
 
@@ -207,6 +253,9 @@ impl fmt::Display for UpdateNotificationError {
             }
             Self::Notification(err) => write!(f, "{err}"),
             Self::Session(err) => write!(f, "{err}"),
+            Self::Settings(err) => {
+                write!(f, "could not disable automatic update checks: {err}")
+            }
             Self::OpenRelease { url, message } => {
                 write!(f, "could not open release URL `{url}`: {message}")
             }
@@ -219,6 +268,7 @@ impl Error for UpdateNotificationError {
         match self {
             Self::Notification(err) => Some(err),
             Self::Session(err) => Some(err),
+            Self::Settings(err) => Some(err),
             Self::InvalidRequest(_) | Self::Transport(_) | Self::OpenRelease { .. } => None,
         }
     }
@@ -233,6 +283,12 @@ impl From<NotificationError> for UpdateNotificationError {
 impl From<SessionServiceError> for UpdateNotificationError {
     fn from(value: SessionServiceError) -> Self {
         Self::Session(value)
+    }
+}
+
+impl From<SettingsError> for UpdateNotificationError {
+    fn from(value: SettingsError) -> Self {
+        Self::Settings(value)
     }
 }
 
@@ -251,36 +307,70 @@ impl UpdateNotificationHandoff for SessionBusUpdateNotificationHandoff {
         &self,
         request: &UpdateNotificationRequest,
     ) -> Result<UpdateNotificationOutcome, UpdateNotificationError> {
-        let connection = DbusConnection::new_session()
+        let mut bus = new_session_bus_client()
             .map_err(|err| UpdateNotificationError::Transport(err.to_string()))?;
-        let proxy = connection.with_proxy(
-            SESSION_BUS_NAME,
-            SESSION_OBJECT_PATH,
-            Duration::from_secs(2),
-        );
-        let (check_channel, current_version, current_channel, latest_version, latest_channel, url) =
-            request.to_dbus_fields();
-        let (outcome,): (String,) = proxy
-            .method_call(
+        show_update_notification_over_session_bus(bus.as_mut(), request)
+    }
+}
+
+fn show_update_notification_over_session_bus<C: SessionBusClient + ?Sized>(
+    bus: &mut C,
+    request: &UpdateNotificationRequest,
+) -> Result<UpdateNotificationOutcome, UpdateNotificationError> {
+    let reply = bus
+        .call_method(
+            BusMethodCall::new(
+                SESSION_BUS_NAME,
+                SESSION_OBJECT_PATH,
                 SESSION_INTERFACE,
                 SHOW_UPDATE_NOTIFICATION_METHOD,
-                (
-                    check_channel,
-                    current_version,
-                    current_channel,
-                    latest_version,
-                    latest_channel,
-                    url,
-                ),
             )
-            .map_err(|err| UpdateNotificationError::Transport(err.to_string()))?;
+            .with_body(request.to_bus_body()),
+        )
+        .map_err(|err| UpdateNotificationError::Transport(err.to_string()))?;
+    let outcome = reply
+        .single_string()
+        .map_err(|err| UpdateNotificationError::Transport(err.to_string()))?;
 
-        UpdateNotificationOutcome::parse(&outcome)
-    }
+    UpdateNotificationOutcome::parse(outcome)
 }
 
 pub(crate) trait ReleaseOpener {
     fn open_release(&self, url: &str) -> Result<(), UpdateNotificationError>;
+}
+
+pub(crate) trait UpdateNotificationPreferences {
+    fn disable_automatic_update_checks(&self) -> Result<(), UpdateNotificationError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SettingsUpdateNotificationPreferences {
+    config_path: Option<PathBuf>,
+}
+
+impl SettingsUpdateNotificationPreferences {
+    fn from_env() -> Self {
+        Self {
+            config_path: ConfigPathResolver::resolve_from_env().ok(),
+        }
+    }
+}
+
+impl UpdateNotificationPreferences for SettingsUpdateNotificationPreferences {
+    fn disable_automatic_update_checks(&self) -> Result<(), UpdateNotificationError> {
+        let command = SettingsCommand::Set {
+            key: "updates.auto_check".to_string(),
+            value: "disabled".to_string(),
+        };
+        let mut output = Vec::new();
+        if let Some(config_path) = &self.config_path {
+            let store = SettingsStore::load(config_path)?;
+            SettingsCommandRunner::new(store).run(command, &mut output)
+        } else {
+            run_settings_command(command, &mut output)
+        }
+        .map_err(UpdateNotificationError::Settings)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -326,18 +416,22 @@ impl ReleaseOpener for SystemReleaseOpener {
     }
 }
 
-pub(crate) struct SessionUpdateNotificationDispatcher<N, O> {
+pub(crate) struct SessionUpdateNotificationDispatcher<N, O, P> {
     notifier: N,
     opener: O,
+    preferences: P,
     pending: HashMap<NotificationId, UpdateNotificationRequest>,
+    recently_closed: VecDeque<(NotificationId, UpdateNotificationRequest)>,
 }
 
-impl<N, O> SessionUpdateNotificationDispatcher<N, O> {
-    fn new(notifier: N, opener: O) -> Self {
+impl<N, O, P> SessionUpdateNotificationDispatcher<N, O, P> {
+    fn new(notifier: N, opener: O, preferences: P) -> Self {
         Self {
             notifier,
             opener,
+            preferences,
             pending: HashMap::new(),
+            recently_closed: VecDeque::new(),
         }
     }
 
@@ -345,12 +439,18 @@ impl<N, O> SessionUpdateNotificationDispatcher<N, O> {
     fn pending_len(&self) -> usize {
         self.pending.len()
     }
+
+    #[cfg(test)]
+    fn recently_closed_len(&self) -> usize {
+        self.recently_closed.len()
+    }
 }
 
-impl<N, O> SessionUpdateNotificationDispatcher<N, O>
+impl<N, O, P> SessionUpdateNotificationDispatcher<N, O, P>
 where
     N: Notifier,
     O: ReleaseOpener,
+    P: UpdateNotificationPreferences,
 {
     fn show_update_notification(
         &mut self,
@@ -373,19 +473,25 @@ where
     ) -> Result<Option<SessionNotificationEvent>, UpdateNotificationError> {
         match signal {
             NotificationSignal::ActionInvoked { id, action_key } => {
-                let Some(request) = self.pending.remove(&id) else {
+                let Some(request) = self.take_action_request(id) else {
                     return Ok(None);
                 };
 
-                if action_key == VIEW_RELEASE_ACTION_KEY {
-                    self.opener.open_release(request.release_url())?;
-                    Ok(Some(SessionNotificationEvent::ReleaseOpened))
-                } else {
-                    Ok(Some(SessionNotificationEvent::UnknownAction))
+                match action_key.as_str() {
+                    VIEW_RELEASE_ACTION_KEY => {
+                        self.opener.open_release(request.release_url())?;
+                        Ok(Some(SessionNotificationEvent::ReleaseOpened))
+                    }
+                    DISABLE_UPDATE_CHECKS_ACTION_KEY => {
+                        self.preferences.disable_automatic_update_checks()?;
+                        Ok(Some(SessionNotificationEvent::UpdateChecksDisabled))
+                    }
+                    _ => Ok(Some(SessionNotificationEvent::UnknownAction)),
                 }
             }
             NotificationSignal::Closed { id, .. } => {
-                if self.pending.remove(&id).is_some() {
+                if let Some(request) = self.pending.remove(&id) {
+                    self.remember_recently_closed(id, request);
                     Ok(Some(SessionNotificationEvent::Closed))
                 } else {
                     Ok(None)
@@ -393,13 +499,46 @@ where
             }
         }
     }
+
+    fn take_action_request(&mut self, id: NotificationId) -> Option<UpdateNotificationRequest> {
+        self.pending.remove(&id).or_else(|| {
+            let index = self
+                .recently_closed
+                .iter()
+                .position(|(closed_id, _)| *closed_id == id)?;
+            self.recently_closed
+                .remove(index)
+                .map(|(_, request)| request)
+        })
+    }
+
+    fn remember_recently_closed(&mut self, id: NotificationId, request: UpdateNotificationRequest) {
+        if self.recently_closed.len() == RECENTLY_CLOSED_NOTIFICATION_LIMIT {
+            self.recently_closed.pop_front();
+        }
+        self.recently_closed.push_back((id, request));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionNotificationEvent {
     ReleaseOpened,
+    UpdateChecksDisabled,
     Closed,
     UnknownAction,
+}
+
+impl SessionNotificationEvent {
+    fn as_log_message(self) -> &'static str {
+        match self {
+            Self::ReleaseOpened => "release URL opened from notification action",
+            Self::UpdateChecksDisabled => {
+                "automatic update checks disabled from notification action"
+            }
+            Self::Closed => "update notification closed",
+            Self::UnknownAction => "unknown notification action ignored",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -458,16 +597,18 @@ pub(crate) fn spawn_session_notification_service(
     let dispatcher = SessionUpdateNotificationDispatcher::new(
         FreedesktopNotifier,
         SystemReleaseOpener::default(),
+        SettingsUpdateNotificationPreferences::from_env(),
     );
     spawn_session_notification_service_with(dispatcher)
 }
 
-fn spawn_session_notification_service_with<N, O>(
-    dispatcher: SessionUpdateNotificationDispatcher<N, O>,
+fn spawn_session_notification_service_with<N, O, P>(
+    dispatcher: SessionUpdateNotificationDispatcher<N, O, P>,
 ) -> Result<SessionNotificationServiceThread, SessionServiceError>
 where
     N: Notifier + Send + 'static,
     O: ReleaseOpener + Send + 'static,
+    P: UpdateNotificationPreferences + Send + 'static,
 {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -530,8 +671,8 @@ fn wait_for_session_notification_service_start_with_timeout(
     }
 }
 
-fn run_session_notification_service_loop<N, O>(
-    dispatcher: SessionUpdateNotificationDispatcher<N, O>,
+fn run_session_notification_service_loop<N, O, P>(
+    dispatcher: SessionUpdateNotificationDispatcher<N, O, P>,
     stop: Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), SessionServiceError>>,
     started: Arc<AtomicBool>,
@@ -539,6 +680,7 @@ fn run_session_notification_service_loop<N, O>(
 where
     N: Notifier + Send + 'static,
     O: ReleaseOpener + Send + 'static,
+    P: UpdateNotificationPreferences + Send + 'static,
 {
     if session_service_startup_stopped(&stop) {
         return Ok(());
@@ -597,13 +739,14 @@ fn session_service_startup_stopped(stop: &AtomicBool) -> bool {
     stop.load(Ordering::SeqCst)
 }
 
-fn register_session_methods<N, O>(
+fn register_session_methods<N, O, P>(
     connection: &DbusConnection,
-    dispatcher: Arc<Mutex<SessionUpdateNotificationDispatcher<N, O>>>,
+    dispatcher: Arc<Mutex<SessionUpdateNotificationDispatcher<N, O, P>>>,
 ) -> Result<(), SessionServiceError>
 where
     N: Notifier + Send + 'static,
     O: ReleaseOpener + Send + 'static,
+    P: UpdateNotificationPreferences + Send + 'static,
 {
     let mut crossroads = Crossroads::new();
     let method_dispatcher = Arc::clone(&dispatcher);
@@ -630,15 +773,16 @@ where
                 latest_channel,
                 release_url,
             ): (String, String, String, String, String, String)| {
-                let request = UpdateNotificationRequest::from_dbus_fields(
-                    check_channel,
-                    current_version,
-                    current_channel,
-                    latest_version,
-                    latest_channel,
-                    release_url,
-                )
-                .map_err(|err| MethodErr::failed(&err.to_string()))?;
+                let body = vec![
+                    BusValue::String(check_channel),
+                    BusValue::String(current_version),
+                    BusValue::String(current_channel),
+                    BusValue::String(latest_version),
+                    BusValue::String(latest_channel),
+                    BusValue::String(release_url),
+                ];
+                let request = UpdateNotificationRequest::from_bus_body(&body)
+                    .map_err(|err| MethodErr::failed(&err.to_string()))?;
 
                 let outcome = method_dispatcher
                     .lock()
@@ -681,13 +825,14 @@ where
     Ok(())
 }
 
-fn register_notification_signal_handler<N, O>(
+fn register_notification_signal_handler<N, O, P>(
     connection: &DbusConnection,
-    dispatcher: Arc<Mutex<SessionUpdateNotificationDispatcher<N, O>>>,
+    dispatcher: Arc<Mutex<SessionUpdateNotificationDispatcher<N, O, P>>>,
 ) -> Result<(), SessionServiceError>
 where
     N: Notifier + Send + 'static,
     O: ReleaseOpener + Send + 'static,
+    P: UpdateNotificationPreferences + Send + 'static,
 {
     let signal_rule = DbusMatchRule::new()
         .with_type(DbusMessageType::Signal)
@@ -707,31 +852,52 @@ where
                     return true;
                 }
             };
-
             let Some(notification_signal) = parse_notification_signal(&bus_signal) else {
+                eprintln!(
+                    "LG Buddy Session: ignored unsupported notification signal `{}` from `{}`",
+                    bus_signal.member,
+                    bus_signal.sender.as_deref().unwrap_or("<missing sender>")
+                );
                 return true;
             };
+            let signal_description = describe_notification_signal(&notification_signal);
 
-            let notification_service_owner = match current_notification_service_owner(conn) {
-                Ok(owner) => owner,
+            let trusted_signal_senders = match trusted_notification_signal_senders(conn) {
+                Ok(owners) => owners,
                 Err(err) => {
                     eprintln!("LG Buddy Session: notification signal owner check failed: {err}");
                     return true;
                 }
             };
-            if !notification_signal_sender_matches_owner(&bus_signal, &notification_service_owner) {
+            if !notification_signal_sender_is_trusted(&bus_signal, &trusted_signal_senders) {
+                eprintln!(
+                    "LG Buddy Session: ignored {signal_description} from untrusted sender `{}`; trusted senders: {}",
+                    bus_signal.sender.as_deref().unwrap_or("<missing sender>"),
+                    trusted_signal_senders.join(", ")
+                );
                 return true;
             }
 
             let result = dispatcher
                 .lock()
                 .map_err(|_| UpdateNotificationError::Session(SessionServiceError::Poisoned))
-                .and_then(|mut dispatcher| {
-                    dispatcher.handle_notification_signal(notification_signal)
-                });
+                .and_then(|mut dispatcher| dispatcher.handle_notification_signal(notification_signal));
 
-            if let Err(err) = result {
-                eprintln!("LG Buddy Session: update notification action failed: {err}");
+            match result {
+                Ok(Some(event)) => {
+                    eprintln!(
+                        "LG Buddy Session: handled {signal_description}: {}",
+                        event.as_log_message()
+                    );
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "LG Buddy Session: ignored {signal_description}: no pending update notification"
+                    );
+                }
+                Err(err) => {
+                    eprintln!("LG Buddy Session: update notification action failed: {err}");
+                }
             }
 
             true
@@ -741,8 +907,21 @@ where
     Ok(())
 }
 
-fn current_notification_service_owner(
+fn trusted_notification_signal_senders(
     connection: &DbusConnection,
+) -> Result<Vec<String>, SessionServiceError> {
+    let mut owners = vec![current_bus_name_owner(connection, NOTIFICATION_SERVICE)?];
+    if let Ok(owner) = current_bus_name_owner(connection, GNOME_SHELL_BUS_NAME) {
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    Ok(owners)
+}
+
+fn current_bus_name_owner(
+    connection: &DbusConnection,
+    name: &str,
 ) -> Result<String, SessionServiceError> {
     let proxy = connection.with_proxy(
         DBUS_SERVICE_NAME,
@@ -750,40 +929,85 @@ fn current_notification_service_owner(
         NOTIFICATION_OWNER_LOOKUP_TIMEOUT,
     );
     let (owner,): (String,) = proxy
-        .method_call(DBUS_INTERFACE, "GetNameOwner", (NOTIFICATION_SERVICE,))
+        .method_call(DBUS_INTERFACE, "GetNameOwner", (name,))
         .map_err(|err| {
-            SessionServiceError::Transport(format!(
-                "could not resolve `{NOTIFICATION_SERVICE}` owner: {err}"
-            ))
+            SessionServiceError::Transport(format!("could not resolve `{name}` owner: {err}"))
         })?;
 
     Ok(owner)
 }
 
-fn notification_signal_sender_matches_owner(
+fn notification_signal_sender_is_trusted(
     signal: &crate::session_bus::BusSignal,
-    owner: &str,
+    trusted_senders: &[String],
 ) -> bool {
-    signal.sender.as_deref() == Some(owner)
+    signal
+        .sender
+        .as_ref()
+        .is_some_and(|sender| trusted_senders.contains(sender))
+}
+
+fn describe_notification_signal(signal: &NotificationSignal) -> String {
+    match signal {
+        NotificationSignal::ActionInvoked { id, action_key } => {
+            format!(
+                "notification action `{action_key}` for notification {}",
+                id.0
+            )
+        }
+        NotificationSignal::Closed { id, reason } => {
+            format!("notification close for notification {} ({reason:?})", id.0)
+        }
+    }
+}
+
+#[cfg(test)]
+fn handle_notification_bus_signal<N, O, P>(
+    dispatcher: &mut SessionUpdateNotificationDispatcher<N, O, P>,
+    bus_signal: &crate::session_bus::BusSignal,
+    trusted_signal_senders: &[String],
+) -> Result<Option<SessionNotificationEvent>, UpdateNotificationError>
+where
+    N: Notifier,
+    O: ReleaseOpener,
+    P: UpdateNotificationPreferences,
+{
+    let Some(notification_signal) = parse_notification_signal(bus_signal) else {
+        return Ok(None);
+    };
+
+    if !notification_signal_sender_is_trusted(bus_signal, trusted_signal_senders) {
+        return Ok(None);
+    }
+
+    dispatcher.handle_notification_signal(notification_signal)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        notification_signal_sender_matches_owner,
+        handle_notification_bus_signal, notification_signal_sender_is_trusted,
+        show_update_notification_over_session_bus,
         wait_for_session_notification_service_start_with_timeout, ReleaseOpener,
-        SessionServiceError, SessionUpdateNotificationDispatcher, UpdateNotificationError,
-        UpdateNotificationOutcome, UpdateNotificationRequest, VIEW_RELEASE_ACTION_KEY,
+        SessionNotificationEvent, SessionServiceError, SessionUpdateNotificationDispatcher,
+        UpdateNotificationError, UpdateNotificationOutcome, UpdateNotificationPreferences,
+        UpdateNotificationRequest, DISABLE_UPDATE_CHECKS_ACTION_KEY, SESSION_BUS_NAME,
+        SESSION_INTERFACE, SESSION_OBJECT_PATH, SHOW_UPDATE_NOTIFICATION_METHOD,
+        VIEW_RELEASE_ACTION_KEY,
     };
     use crate::notifications::{
         Notification, NotificationCapabilities, NotificationError, NotificationId,
         NotificationSignal, Notifier, NOTIFICATION_INTERFACE, NOTIFICATION_PATH,
     };
-    use crate::session_bus::BusSignal;
+    use crate::session_bus::{
+        BusMethodCall, BusReply, BusSignal, BusSignalMatch, BusValue, SessionBusClient,
+        SessionBusError,
+    };
     use crate::updates::UpdateChannel;
     use crate::version::ReleaseChannel;
     use semver::Version;
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -831,6 +1055,65 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedBusMethodCall {
+        destination: String,
+        path: String,
+        interface: String,
+        member: String,
+        body: Vec<BusValue>,
+    }
+
+    impl From<BusMethodCall<'_>> for RecordedBusMethodCall {
+        fn from(value: BusMethodCall<'_>) -> Self {
+            Self {
+                destination: value.destination.to_string(),
+                path: value.path.to_string(),
+                interface: value.interface.to_string(),
+                member: value.member.to_string(),
+                body: value.body,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingSessionBus {
+        calls: Vec<RecordedBusMethodCall>,
+        replies: VecDeque<Result<BusReply, SessionBusError>>,
+    }
+
+    impl RecordingSessionBus {
+        fn new(replies: Vec<Result<BusReply, SessionBusError>>) -> Self {
+            Self {
+                calls: Vec::new(),
+                replies: replies.into(),
+            }
+        }
+    }
+
+    impl SessionBusClient for RecordingSessionBus {
+        fn name_has_owner(&mut self, _name: &str) -> Result<bool, SessionBusError> {
+            Ok(true)
+        }
+
+        fn call_method(&mut self, call: BusMethodCall<'_>) -> Result<BusReply, SessionBusError> {
+            self.calls.push(call.into());
+            self.replies.pop_front().unwrap_or_else(|| {
+                Err(SessionBusError::Transport(
+                    "unexpected method call".to_string(),
+                ))
+            })
+        }
+
+        fn add_signal_match(&mut self, _rule: BusSignalMatch<'_>) -> Result<(), SessionBusError> {
+            Ok(())
+        }
+
+        fn process(&mut self, _timeout: Duration) -> Result<Option<BusSignal>, SessionBusError> {
+            Ok(None)
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RecordingOpener {
         opened: RefCell<Vec<String>>,
@@ -864,6 +1147,38 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingPreferences {
+        disable_calls: RefCell<usize>,
+        fail: bool,
+    }
+
+    impl RecordingPreferences {
+        fn failing() -> Self {
+            Self {
+                disable_calls: RefCell::new(0),
+                fail: true,
+            }
+        }
+
+        fn disable_calls(&self) -> usize {
+            *self.disable_calls.borrow()
+        }
+    }
+
+    impl UpdateNotificationPreferences for RecordingPreferences {
+        fn disable_automatic_update_checks(&self) -> Result<(), UpdateNotificationError> {
+            *self.disable_calls.borrow_mut() += 1;
+            if self.fail {
+                Err(UpdateNotificationError::Transport(
+                    "settings update failed".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn request() -> UpdateNotificationRequest {
         UpdateNotificationRequest::new(
             UpdateChannel::Stable,
@@ -887,6 +1202,45 @@ mod tests {
         .expect("request should parse");
 
         assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn request_round_trips_through_bus_body() {
+        let request = request();
+        let body = request.to_bus_body();
+
+        let parsed = UpdateNotificationRequest::from_bus_body(&body).expect("request should parse");
+
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn handoff_sends_update_notification_method_call_over_session_bus() {
+        let mut bus = RecordingSessionBus::new(vec![Ok(BusReply::new(vec![BusValue::String(
+            "sent".to_string(),
+        )]))]);
+
+        let outcome = show_update_notification_over_session_bus(&mut bus, &request())
+            .expect("handoff should succeed");
+
+        assert_eq!(outcome, UpdateNotificationOutcome::Sent);
+        assert_eq!(
+            bus.calls,
+            vec![RecordedBusMethodCall {
+                destination: SESSION_BUS_NAME.to_string(),
+                path: SESSION_OBJECT_PATH.to_string(),
+                interface: SESSION_INTERFACE.to_string(),
+                member: SHOW_UPDATE_NOTIFICATION_METHOD.to_string(),
+                body: vec![
+                    BusValue::String("stable".to_string()),
+                    BusValue::String("1.1.0".to_string()),
+                    BusValue::String("stable".to_string()),
+                    BusValue::String("1.1.1".to_string()),
+                    BusValue::String("stable".to_string()),
+                    BusValue::String("https://github.test/releases/tag/v1.1.1".to_string()),
+                ],
+            }]
+        );
     }
 
     #[test]
@@ -918,13 +1272,35 @@ mod tests {
             "".to_string(),
         )
         .is_err());
+        assert!(UpdateNotificationRequest::from_bus_body(&[BusValue::U32(7)]).is_err());
+    }
+
+    fn action_invoked_bus_signal(action_key: &str, sender: &str) -> BusSignal {
+        BusSignal::new(NOTIFICATION_PATH, NOTIFICATION_INTERFACE, "ActionInvoked")
+            .with_sender(sender)
+            .with_body(vec![
+                BusValue::U32(7),
+                BusValue::String(action_key.to_string()),
+            ])
+    }
+
+    fn notification_closed_bus_signal(sender: &str) -> BusSignal {
+        BusSignal::new(
+            NOTIFICATION_PATH,
+            NOTIFICATION_INTERFACE,
+            "NotificationClosed",
+        )
+        .with_sender(sender)
+        .with_body(vec![BusValue::U32(7), BusValue::U32(2)])
     }
 
     #[test]
     fn action_capable_notification_attaches_view_release_button() {
         let notifier = RecordingNotifier::new(true);
         let opener = RecordingOpener::default();
-        let mut dispatcher = SessionUpdateNotificationDispatcher::new(notifier, opener);
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
 
         let outcome = dispatcher
             .show_update_notification(request())
@@ -933,8 +1309,14 @@ mod tests {
         assert_eq!(outcome, UpdateNotificationOutcome::Sent);
         let notifications = dispatcher.notifier.notifications();
         assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].actions.len(), 1);
-        assert_eq!(notifications[0].actions[0].key, VIEW_RELEASE_ACTION_KEY);
+        assert_eq!(notifications[0].actions.len(), 2);
+        assert_eq!(
+            notifications[0].actions[0].key,
+            DISABLE_UPDATE_CHECKS_ACTION_KEY
+        );
+        assert_eq!(notifications[0].actions[0].label, "Never Notify Again");
+        assert_eq!(notifications[0].actions[1].key, VIEW_RELEASE_ACTION_KEY);
+        assert_eq!(notifications[0].actions[1].label, "View Release");
         assert_eq!(dispatcher.pending_len(), 1);
     }
 
@@ -942,7 +1324,9 @@ mod tests {
     fn passive_notification_does_not_store_pending_action_state() {
         let notifier = RecordingNotifier::new(false);
         let opener = RecordingOpener::default();
-        let mut dispatcher = SessionUpdateNotificationDispatcher::new(notifier, opener);
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
 
         dispatcher
             .show_update_notification(request())
@@ -956,7 +1340,9 @@ mod tests {
     fn notification_failure_does_not_store_pending_state() {
         let notifier = RecordingNotifier::failing();
         let opener = RecordingOpener::default();
-        let mut dispatcher = SessionUpdateNotificationDispatcher::new(notifier, opener);
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
 
         dispatcher
             .show_update_notification(request())
@@ -992,23 +1378,102 @@ mod tests {
     }
 
     #[test]
-    fn notification_signal_sender_must_match_notification_daemon_owner() {
+    fn notification_signal_sender_must_be_trusted() {
         let signal = BusSignal::new(NOTIFICATION_PATH, NOTIFICATION_INTERFACE, "ActionInvoked")
             .with_sender(":1.42");
+        let trusted_senders = vec![":1.42".to_string(), ":1.24".to_string()];
 
-        assert!(notification_signal_sender_matches_owner(&signal, ":1.42"));
-        assert!(!notification_signal_sender_matches_owner(&signal, ":1.99"));
-        assert!(!notification_signal_sender_matches_owner(
-            &BusSignal::new(NOTIFICATION_PATH, NOTIFICATION_INTERFACE, "ActionInvoked"),
-            ":1.42",
+        assert!(notification_signal_sender_is_trusted(
+            &signal,
+            &trusted_senders
         ));
+        assert!(!notification_signal_sender_is_trusted(
+            &BusSignal::new(NOTIFICATION_PATH, NOTIFICATION_INTERFACE, "ActionInvoked")
+                .with_sender(":1.99"),
+            &trusted_senders
+        ));
+        assert!(!notification_signal_sender_is_trusted(
+            &BusSignal::new(NOTIFICATION_PATH, NOTIFICATION_INTERFACE, "ActionInvoked"),
+            &trusted_senders,
+        ));
+    }
+
+    #[test]
+    fn notification_owner_action_signal_from_bus_disables_updates() {
+        let notifier = RecordingNotifier::new(true);
+        let opener = RecordingOpener::default();
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
+        dispatcher
+            .show_update_notification(request())
+            .expect("notification should send");
+
+        let event = handle_notification_bus_signal(
+            &mut dispatcher,
+            &action_invoked_bus_signal(DISABLE_UPDATE_CHECKS_ACTION_KEY, ":1.42"),
+            &[":1.42".to_string(), ":1.24".to_string()],
+        )
+        .expect("bus action should succeed");
+
+        assert_eq!(event, Some(SessionNotificationEvent::UpdateChecksDisabled));
+        assert_eq!(dispatcher.preferences.disable_calls(), 1);
+        assert_eq!(dispatcher.pending_len(), 0);
+    }
+
+    #[test]
+    fn gnome_shell_action_signal_from_bus_disables_updates() {
+        let notifier = RecordingNotifier::new(true);
+        let opener = RecordingOpener::default();
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
+        dispatcher
+            .show_update_notification(request())
+            .expect("notification should send");
+
+        let event = handle_notification_bus_signal(
+            &mut dispatcher,
+            &action_invoked_bus_signal(DISABLE_UPDATE_CHECKS_ACTION_KEY, ":1.24"),
+            &[":1.42".to_string(), ":1.24".to_string()],
+        )
+        .expect("bus action should succeed");
+
+        assert_eq!(event, Some(SessionNotificationEvent::UpdateChecksDisabled));
+        assert_eq!(dispatcher.preferences.disable_calls(), 1);
+        assert_eq!(dispatcher.pending_len(), 0);
+    }
+
+    #[test]
+    fn spoofed_action_signal_from_bus_is_ignored() {
+        let notifier = RecordingNotifier::new(true);
+        let opener = RecordingOpener::default();
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
+        dispatcher
+            .show_update_notification(request())
+            .expect("notification should send");
+
+        let event = handle_notification_bus_signal(
+            &mut dispatcher,
+            &action_invoked_bus_signal(DISABLE_UPDATE_CHECKS_ACTION_KEY, ":1.99"),
+            &[":1.42".to_string(), ":1.24".to_string()],
+        )
+        .expect("spoofed signal should be ignored without error");
+
+        assert_eq!(event, None);
+        assert_eq!(dispatcher.preferences.disable_calls(), 0);
+        assert_eq!(dispatcher.pending_len(), 1);
     }
 
     #[test]
     fn view_release_action_opens_url_and_clears_pending_state() {
         let notifier = RecordingNotifier::new(true);
         let opener = RecordingOpener::default();
-        let mut dispatcher = SessionUpdateNotificationDispatcher::new(notifier, opener);
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
         dispatcher
             .show_update_notification(request())
             .expect("notification should send");
@@ -1024,6 +1489,30 @@ mod tests {
             dispatcher.opener.opened(),
             vec!["https://github.test/releases/tag/v1.1.1".to_string()]
         );
+        assert_eq!(dispatcher.preferences.disable_calls(), 0);
+        assert_eq!(dispatcher.pending_len(), 0);
+    }
+
+    #[test]
+    fn never_notify_again_action_disables_updates_and_clears_pending_state() {
+        let notifier = RecordingNotifier::new(true);
+        let opener = RecordingOpener::default();
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
+        dispatcher
+            .show_update_notification(request())
+            .expect("notification should send");
+
+        dispatcher
+            .handle_notification_signal(NotificationSignal::ActionInvoked {
+                id: NotificationId(7),
+                action_key: DISABLE_UPDATE_CHECKS_ACTION_KEY.to_string(),
+            })
+            .expect("opt out action should succeed");
+
+        assert!(dispatcher.opener.opened().is_empty());
+        assert_eq!(dispatcher.preferences.disable_calls(), 1);
         assert_eq!(dispatcher.pending_len(), 0);
     }
 
@@ -1031,7 +1520,9 @@ mod tests {
     fn opener_failure_clears_pending_state_and_reports_error() {
         let notifier = RecordingNotifier::new(true);
         let opener = RecordingOpener::failing();
-        let mut dispatcher = SessionUpdateNotificationDispatcher::new(notifier, opener);
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
         dispatcher
             .show_update_notification(request())
             .expect("notification should send");
@@ -1047,10 +1538,34 @@ mod tests {
     }
 
     #[test]
+    fn opt_out_failure_clears_pending_state_and_reports_error() {
+        let notifier = RecordingNotifier::new(true);
+        let opener = RecordingOpener::default();
+        let preferences = RecordingPreferences::failing();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
+        dispatcher
+            .show_update_notification(request())
+            .expect("notification should send");
+
+        dispatcher
+            .handle_notification_signal(NotificationSignal::ActionInvoked {
+                id: NotificationId(7),
+                action_key: DISABLE_UPDATE_CHECKS_ACTION_KEY.to_string(),
+            })
+            .expect_err("settings update should fail");
+
+        assert_eq!(dispatcher.preferences.disable_calls(), 1);
+        assert_eq!(dispatcher.pending_len(), 0);
+    }
+
+    #[test]
     fn closed_signal_clears_pending_state() {
         let notifier = RecordingNotifier::new(true);
         let opener = RecordingOpener::default();
-        let mut dispatcher = SessionUpdateNotificationDispatcher::new(notifier, opener);
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
         dispatcher
             .show_update_notification(request())
             .expect("notification should send");
@@ -1063,5 +1578,35 @@ mod tests {
             .expect("close should succeed");
 
         assert_eq!(dispatcher.pending_len(), 0);
+        assert_eq!(dispatcher.recently_closed_len(), 1);
+    }
+
+    #[test]
+    fn action_after_closed_signal_still_uses_notification_context() {
+        let notifier = RecordingNotifier::new(true);
+        let opener = RecordingOpener::default();
+        let preferences = RecordingPreferences::default();
+        let mut dispatcher =
+            SessionUpdateNotificationDispatcher::new(notifier, opener, preferences);
+        dispatcher
+            .show_update_notification(request())
+            .expect("notification should send");
+
+        handle_notification_bus_signal(
+            &mut dispatcher,
+            &notification_closed_bus_signal(":1.42"),
+            &[":1.42".to_string()],
+        )
+        .expect("close should succeed");
+        handle_notification_bus_signal(
+            &mut dispatcher,
+            &action_invoked_bus_signal(DISABLE_UPDATE_CHECKS_ACTION_KEY, ":1.42"),
+            &[":1.42".to_string()],
+        )
+        .expect("action should succeed");
+
+        assert_eq!(dispatcher.preferences.disable_calls(), 1);
+        assert_eq!(dispatcher.pending_len(), 0);
+        assert_eq!(dispatcher.recently_closed_len(), 0);
     }
 }
