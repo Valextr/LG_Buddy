@@ -8,6 +8,7 @@ use evdev::Device;
 use super::{is_controller_axis_code, is_controller_button_code, DeviceId};
 
 const SYS_CLASS_INPUT_DIR: &str = "/sys/class/input";
+const UDEV_DATA_DIR: &str = "/run/udev/data";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GamepadDevice {
@@ -56,10 +57,24 @@ struct DeviceInspection {
     product_id: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct InputDeviceMetadata {
+    properties: Vec<(String, String)>,
+    symlinks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GamepadCandidate {
+    Candidate,
+    NonCandidate,
+    Unknown,
+}
+
 pub(crate) fn discover_gamepad_devices(input_dir: &Path) -> DeviceDiscovery {
     discover_gamepad_devices_from_dirs(
         input_dir,
         Path::new(SYS_CLASS_INPUT_DIR),
+        Path::new(UDEV_DATA_DIR),
         inspect_evdev_device,
     )
 }
@@ -67,6 +82,7 @@ pub(crate) fn discover_gamepad_devices(input_dir: &Path) -> DeviceDiscovery {
 fn discover_gamepad_devices_from_dirs(
     input_dir: &Path,
     sys_class_input_dir: &Path,
+    udev_data_dir: &Path,
     mut inspect_device: impl FnMut(&Path) -> io::Result<DeviceInspection>,
 ) -> DeviceDiscovery {
     let mut devices = Vec::new();
@@ -84,6 +100,12 @@ fn discover_gamepad_devices_from_dirs(
     };
 
     for path in event_paths {
+        if gamepad_candidate_for_event_path(&path, sys_class_input_dir, udev_data_dir)
+            == GamepadCandidate::NonCandidate
+        {
+            continue;
+        }
+
         match inspect_device(&path) {
             Ok(inspection) => {
                 if capabilities_are_gamepad_like(&inspection.capabilities) {
@@ -136,6 +158,92 @@ pub(crate) fn capabilities_are_gamepad_like(capabilities: &DeviceCapabilities) -
         .any(|code| is_controller_axis_code(*code));
 
     controller_button_count > 0 && (has_controller_axis || controller_button_count >= 2)
+}
+
+fn gamepad_candidate_for_event_path(
+    event_path: &Path,
+    sys_class_input_dir: &Path,
+    udev_data_dir: &Path,
+) -> GamepadCandidate {
+    let Some(event_name) = event_path.file_name() else {
+        return GamepadCandidate::Unknown;
+    };
+
+    let Ok(device_number) = fs::read_to_string(sys_class_input_dir.join(event_name).join("dev"))
+    else {
+        return GamepadCandidate::Unknown;
+    };
+
+    let udev_data_path = udev_data_dir.join(format!("c{}", device_number.trim()));
+    let Ok(contents) = fs::read_to_string(udev_data_path) else {
+        return GamepadCandidate::Unknown;
+    };
+
+    classify_gamepad_candidate(&parse_udev_device_metadata(&contents))
+}
+
+fn parse_udev_device_metadata(contents: &str) -> InputDeviceMetadata {
+    let mut metadata = InputDeviceMetadata::default();
+
+    for line in contents.lines() {
+        if let Some(symlink) = line.strip_prefix("S:") {
+            metadata.symlinks.push(symlink.to_string());
+        } else if let Some(property) = line.strip_prefix("E:") {
+            if let Some((key, value)) = property.split_once('=') {
+                metadata
+                    .properties
+                    .push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+
+    metadata
+}
+
+fn classify_gamepad_candidate(metadata: &InputDeviceMetadata) -> GamepadCandidate {
+    if metadata.property_is("ID_INPUT_JOYSTICK", "1")
+        || metadata
+            .symlinks
+            .iter()
+            .any(|symlink| symlink.ends_with("-event-joystick"))
+    {
+        return GamepadCandidate::Candidate;
+    }
+
+    if metadata.has_non_gamepad_input_property()
+        || metadata
+            .symlinks
+            .iter()
+            .any(|symlink| symlink.ends_with("-event-kbd") || symlink.ends_with("-event-mouse"))
+    {
+        return GamepadCandidate::NonCandidate;
+    }
+
+    GamepadCandidate::Unknown
+}
+
+impl InputDeviceMetadata {
+    fn property_is(&self, key: &str, expected: &str) -> bool {
+        self.properties
+            .iter()
+            .any(|(name, value)| name == key && value == expected)
+    }
+
+    fn has_non_gamepad_input_property(&self) -> bool {
+        const NON_GAMEPAD_INPUT_PROPERTIES: &[&str] = &[
+            "ID_INPUT_ACCELEROMETER",
+            "ID_INPUT_KEY",
+            "ID_INPUT_KEYBOARD",
+            "ID_INPUT_MOUSE",
+            "ID_INPUT_TABLET",
+            "ID_INPUT_TOUCHPAD",
+            "ID_INPUT_TOUCHSCREEN",
+        ];
+
+        NON_GAMEPAD_INPUT_PROPERTIES
+            .iter()
+            .any(|key| self.property_is(key, "1"))
+    }
 }
 
 fn event_device_paths(input_dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -223,8 +331,9 @@ fn inspect_error_message(err: &io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capabilities_are_gamepad_like, discover_gamepad_devices_from_dirs,
-        hidraw_paths_for_event_name, DeviceCapabilities, DeviceInspection,
+        capabilities_are_gamepad_like, classify_gamepad_candidate,
+        discover_gamepad_devices_from_dirs, hidraw_paths_for_event_name,
+        parse_udev_device_metadata, DeviceCapabilities, DeviceInspection, GamepadCandidate,
     };
     use crate::session::gamepad::DeviceId;
     use std::ffi::OsStr;
@@ -267,6 +376,17 @@ mod tests {
 
     fn create_event_file(input_dir: &Path, name: &str) {
         fs::write(input_dir.join(name), []).expect("create input event file");
+    }
+
+    fn map_event_to_udev(root: &Path, event_name: &str, device_number: &str, udev_record: &str) {
+        let sys_class_input = root.join("sys/class/input");
+        let event_dir = sys_class_input.join(event_name);
+        let udev_data_dir = root.join("run/udev/data");
+        fs::create_dir_all(&event_dir).expect("create event sysfs dir");
+        fs::write(event_dir.join("dev"), device_number).expect("write input device number");
+        fs::create_dir_all(&udev_data_dir).expect("create udev data dir");
+        fs::write(udev_data_dir.join(format!("c{device_number}")), udev_record)
+            .expect("write udev data");
     }
 
     fn map_event_to_hidraw(root: &Path, event_name: &str, hidraw_names: &[&str]) {
@@ -348,6 +468,79 @@ mod tests {
     }
 
     #[test]
+    fn udev_joystick_property_marks_gamepad_candidate() {
+        let metadata = parse_udev_device_metadata(
+            r#"
+E:ID_INPUT=1
+E:ID_INPUT_JOYSTICK=1
+E:ID_INPUT_KEY=1
+"#,
+        );
+
+        assert_eq!(
+            classify_gamepad_candidate(&metadata),
+            GamepadCandidate::Candidate
+        );
+    }
+
+    #[test]
+    fn event_joystick_symlink_marks_gamepad_candidate() {
+        let metadata = parse_udev_device_metadata(
+            r#"
+S:input/by-id/usb-Test_Controller-event-joystick
+E:ID_INPUT=1
+"#,
+        );
+
+        assert_eq!(
+            classify_gamepad_candidate(&metadata),
+            GamepadCandidate::Candidate
+        );
+    }
+
+    #[test]
+    fn udev_keyboard_and_mouse_metadata_marks_non_candidates() {
+        let keyboard = parse_udev_device_metadata(
+            r#"
+S:input/by-id/usb-Test_Keyboard-event-kbd
+E:ID_INPUT=1
+E:ID_INPUT_KEY=1
+E:ID_INPUT_KEYBOARD=1
+"#,
+        );
+        let mouse = parse_udev_device_metadata(
+            r#"
+S:input/by-id/usb-Test_Mouse-event-mouse
+E:ID_INPUT=1
+E:ID_INPUT_MOUSE=1
+"#,
+        );
+
+        assert_eq!(
+            classify_gamepad_candidate(&keyboard),
+            GamepadCandidate::NonCandidate
+        );
+        assert_eq!(
+            classify_gamepad_candidate(&mouse),
+            GamepadCandidate::NonCandidate
+        );
+    }
+
+    #[test]
+    fn sparse_udev_metadata_keeps_candidate_status_unknown() {
+        let metadata = parse_udev_device_metadata(
+            r#"
+E:ID_INPUT=1
+"#,
+        );
+
+        assert_eq!(
+            classify_gamepad_candidate(&metadata),
+            GamepadCandidate::Unknown
+        );
+    }
+
+    #[test]
     fn hidraw_paths_are_mapped_from_event_sysfs_device() {
         let root = temp_dir("hidraw-map");
         let sys_class_input = root.join("sys/class/input");
@@ -385,14 +578,19 @@ mod tests {
         map_event_to_hidraw(&root, "event2", &["hidraw8", "hidraw2"]);
 
         let mut inspected_paths = Vec::new();
-        let discovery = discover_gamepad_devices_from_dirs(&input_dir, &sys_class_input, |path| {
-            inspected_paths.push(path.file_name().expect("file name").to_owned());
-            match path.file_name().and_then(|name| name.to_str()) {
-                Some("event2") => Ok(gamepad_inspection(0x054c, 0x0df2)),
-                Some("event10") => Ok(keyboard_inspection()),
-                other => panic!("unexpected inspected path: {other:?}"),
-            }
-        });
+        let discovery = discover_gamepad_devices_from_dirs(
+            &input_dir,
+            &sys_class_input,
+            &root.join("run/udev/data"),
+            |path| {
+                inspected_paths.push(path.file_name().expect("file name").to_owned());
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("event2") => Ok(gamepad_inspection(0x054c, 0x0df2)),
+                    Some("event10") => Ok(keyboard_inspection()),
+                    other => panic!("unexpected inspected path: {other:?}"),
+                }
+            },
+        );
 
         assert_eq!(discovery.input_dir_error, None);
         assert!(discovery.inspect_failures.is_empty());
@@ -429,13 +627,16 @@ mod tests {
         create_event_file(&input_dir, "event0");
         create_event_file(&input_dir, "event1");
 
-        let discovery = discover_gamepad_devices_from_dirs(&input_dir, &sys_class_input, |path| {
-            match path.file_name().and_then(|name| name.to_str()) {
+        let discovery = discover_gamepad_devices_from_dirs(
+            &input_dir,
+            &sys_class_input,
+            &root.join("run/udev/data"),
+            |path| match path.file_name().and_then(|name| name.to_str()) {
                 Some("event0") => Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope")),
                 Some("event1") => Ok(gamepad_inspection(0x045e, 0x0b13)),
                 other => panic!("unexpected inspected path: {other:?}"),
-            }
-        });
+            },
+        );
 
         assert_eq!(discovery.input_dir_error, None);
         assert_eq!(discovery.devices.len(), 1);
@@ -453,13 +654,159 @@ mod tests {
         let input_dir = root.join("missing-input");
         let sys_class_input = root.join("sys/class/input");
 
-        let discovery = discover_gamepad_devices_from_dirs(&input_dir, &sys_class_input, |_| {
-            panic!("input directory errors should stop before inspection")
-        });
+        let discovery = discover_gamepad_devices_from_dirs(
+            &input_dir,
+            &sys_class_input,
+            &root.join("run/udev/data"),
+            |_| panic!("input directory errors should stop before inspection"),
+        );
 
         assert!(discovery.input_dir_error.is_some());
         assert!(discovery.devices.is_empty());
         assert!(discovery.inspect_failures.is_empty());
+
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn discovery_skips_known_non_candidate_input_devices_before_evdev_open() {
+        let root = temp_dir("discover-skip-non-candidate");
+        let input_dir = root.join("dev/input");
+        let sys_class_input = root.join("sys/class/input");
+        let udev_data_dir = root.join("run/udev/data");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        create_event_file(&input_dir, "event0");
+        create_event_file(&input_dir, "event5");
+        map_event_to_udev(&root, "event0", "13:64", "E:ID_INPUT=1\nE:ID_INPUT_KEY=1\n");
+        map_event_to_udev(
+            &root,
+            "event5",
+            "13:69",
+            "S:input/by-id/usb-Test_Controller-event-joystick\nE:ID_INPUT=1\n",
+        );
+
+        let mut inspected_paths = Vec::new();
+        let discovery = discover_gamepad_devices_from_dirs(
+            &input_dir,
+            &sys_class_input,
+            &udev_data_dir,
+            |path| {
+                inspected_paths.push(path.file_name().expect("file name").to_owned());
+                Ok(gamepad_inspection(0x046d, 0xc267))
+            },
+        );
+
+        assert_eq!(discovery.input_dir_error, None);
+        assert!(discovery.inspect_failures.is_empty());
+        assert_eq!(inspected_paths, vec![OsStr::new("event5").to_owned()]);
+        assert_eq!(discovery.devices.len(), 1);
+        assert_eq!(discovery.devices[0].path, input_dir.join("event5"));
+
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn discovery_accepts_dualsense_like_gamepad_with_touch_and_motion_metadata() {
+        let root = temp_dir("discover-dualsense");
+        let input_dir = root.join("dev/input");
+        let sys_class_input = root.join("sys/class/input");
+        let udev_data_dir = root.join("run/udev/data");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        create_event_file(&input_dir, "event9");
+        create_event_file(&input_dir, "event10");
+        create_event_file(&input_dir, "event11");
+        map_event_to_udev(
+            &root,
+            "event9",
+            "13:73",
+            r#"S:input/by-id/usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-if03-event-joystick
+E:ID_INPUT=1
+E:ID_INPUT_JOYSTICK=1
+E:ID_INPUT_ACCELEROMETER=1
+E:ID_INPUT_TOUCHPAD=1
+E:ID_VENDOR_ID=054c
+E:ID_MODEL_ID=0df2
+"#,
+        );
+        map_event_to_udev(
+            &root,
+            "event10",
+            "13:74",
+            r#"S:input/by-id/usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-event-if03
+E:ID_INPUT=1
+E:ID_INPUT_ACCELEROMETER=1
+E:ID_VENDOR_ID=054c
+E:ID_MODEL_ID=0df2
+"#,
+        );
+        map_event_to_udev(
+            &root,
+            "event11",
+            "13:75",
+            r#"S:input/by-id/usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-if03-event-mouse
+E:ID_INPUT=1
+E:ID_INPUT_MOUSE=1
+E:ID_INPUT_TOUCHPAD=1
+E:ID_VENDOR_ID=054c
+E:ID_MODEL_ID=0df2
+"#,
+        );
+
+        let mut inspected_paths = Vec::new();
+        let discovery = discover_gamepad_devices_from_dirs(
+            &input_dir,
+            &sys_class_input,
+            &udev_data_dir,
+            |path| {
+                inspected_paths.push(path.file_name().expect("file name").to_owned());
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("event9") => Ok(gamepad_inspection(0x054c, 0x0df2)),
+                    other => panic!("unexpected inspected path: {other:?}"),
+                }
+            },
+        );
+
+        assert_eq!(discovery.input_dir_error, None);
+        assert!(discovery.inspect_failures.is_empty());
+        assert_eq!(inspected_paths, vec![OsStr::new("event9").to_owned()]);
+        assert_eq!(discovery.devices.len(), 1);
+        assert_eq!(discovery.devices[0].path, input_dir.join("event9"));
+        assert_eq!(discovery.devices[0].vendor_id, 0x054c);
+        assert_eq!(discovery.devices[0].product_id, 0x0df2);
+
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn discovery_keeps_permission_failure_for_known_gamepad_candidates() {
+        let root = temp_dir("discover-candidate-failure");
+        let input_dir = root.join("dev/input");
+        let sys_class_input = root.join("sys/class/input");
+        let udev_data_dir = root.join("run/udev/data");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        create_event_file(&input_dir, "event5");
+        map_event_to_udev(
+            &root,
+            "event5",
+            "13:69",
+            "E:ID_INPUT=1\nE:ID_INPUT_JOYSTICK=1\n",
+        );
+
+        let discovery = discover_gamepad_devices_from_dirs(
+            &input_dir,
+            &sys_class_input,
+            &udev_data_dir,
+            |path| match path.file_name().and_then(|name| name.to_str()) {
+                Some("event5") => Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope")),
+                other => panic!("unexpected inspected path: {other:?}"),
+            },
+        );
+
+        assert_eq!(discovery.input_dir_error, None);
+        assert!(discovery.devices.is_empty());
+        assert_eq!(discovery.inspect_failures.len(), 1);
+        assert_eq!(discovery.inspect_failures[0].path, input_dir.join("event5"));
+        assert_eq!(discovery.inspect_failures[0].error, "permission denied");
 
         fs::remove_dir_all(root).expect("remove temp dir");
     }
