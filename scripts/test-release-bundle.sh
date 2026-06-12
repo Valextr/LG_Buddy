@@ -25,6 +25,36 @@ assert_executable() {
     fi
 }
 
+assert_lifecycle_topology_installed() {
+    assert_file "$SYSTEM_SERVICE"
+    assert_file "$LIFECYCLE_SERVICE"
+    grep -q 'ExecStart=/usr/bin/lg-buddy lifecycle' "$LIFECYCLE_SERVICE"
+    assert_file "$USER_SCREEN_SERVICE"
+    assert_file "$USER_UPDATE_CHECK_SERVICE"
+    assert_file "$USER_UPDATE_CHECK_TIMER"
+    assert_file "$USER_UPDATE_CHECK_OVERRIDE"
+    grep -q '^OnCalendar=weekly$' "$USER_UPDATE_CHECK_TIMER"
+    grep -q '^WantedBy=graphical-session.target$' "$USER_UPDATE_CHECK_TIMER"
+    [ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
+        echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
+        exit 1
+    }
+    [ ! -e "$LEGACY_WAKE_SERVICE" ] || {
+        echo "Legacy wake service installed unexpectedly: $LEGACY_WAKE_SERVICE"
+        exit 1
+    }
+    [ ! -e "$NM_SLEEP_HOOK" ] || {
+        echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
+        exit 1
+    }
+    [ ! -e "$SYSTEM_SLEEP_HOOK" ] || {
+        echo "Legacy systemd sleep hook installed unexpectedly: $SYSTEM_SLEEP_HOOK"
+        exit 1
+    }
+    assert_executable "$NM_LIFECYCLE_HOOK"
+    grep -q 'lg-buddy nm-pre-down' "$NM_LIFECYCLE_HOOK"
+}
+
 validate_archive_paths() {
     local archive="$1"
     local entry=""
@@ -186,34 +216,8 @@ assert_file "$CONFIG_FILE"
 assert_executable "$INSTALLED_BINARY"
 assert_executable "$INSTALLED_VENV_PIP"
 assert_file "$INSTALLED_POINTER"
-assert_file "$SYSTEM_SERVICE"
-assert_file "$LIFECYCLE_SERVICE"
-grep -q 'ExecStart=/usr/bin/lg-buddy lifecycle' "$LIFECYCLE_SERVICE"
-assert_file "$USER_SCREEN_SERVICE"
-assert_file "$USER_UPDATE_CHECK_SERVICE"
-assert_file "$USER_UPDATE_CHECK_TIMER"
-assert_file "$USER_UPDATE_CHECK_OVERRIDE"
-grep -q '^OnCalendar=weekly$' "$USER_UPDATE_CHECK_TIMER"
-grep -q '^WantedBy=graphical-session.target$' "$USER_UPDATE_CHECK_TIMER"
+assert_lifecycle_topology_installed
 assert_file "$DESKTOP_ENTRY"
-[ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
-    echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
-    exit 1
-}
-[ ! -e "$LEGACY_WAKE_SERVICE" ] || {
-    echo "Legacy wake service installed unexpectedly: $LEGACY_WAKE_SERVICE"
-    exit 1
-}
-[ ! -e "$NM_SLEEP_HOOK" ] || {
-    echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
-    exit 1
-}
-[ ! -e "$SYSTEM_SLEEP_HOOK" ] || {
-    echo "Legacy systemd sleep hook installed unexpectedly: $SYSTEM_SLEEP_HOOK"
-    exit 1
-}
-assert_executable "$NM_LIFECYCLE_HOOK"
-grep -q 'lg-buddy nm-pre-down' "$NM_LIFECYCLE_HOOK"
 if grep -q 'LG_BUDDY_CONFIG' "$NM_LIFECYCLE_HOOK"; then
     echo "NetworkManager lifecycle hook should rely on installed config pointer, not embed LG_BUDDY_CONFIG."
     exit 1
@@ -371,33 +375,7 @@ assert_executable "$INSTALLED_BINARY"
     echo "Installer left stale virtualenv contents in place: $STALE_VENV_MARKER"
     exit 1
 }
-assert_file "$SYSTEM_SERVICE"
-assert_file "$LIFECYCLE_SERVICE"
-grep -q 'ExecStart=/usr/bin/lg-buddy lifecycle' "$LIFECYCLE_SERVICE"
-assert_file "$USER_SCREEN_SERVICE"
-assert_file "$USER_UPDATE_CHECK_SERVICE"
-assert_file "$USER_UPDATE_CHECK_TIMER"
-assert_file "$USER_UPDATE_CHECK_OVERRIDE"
-grep -q '^OnCalendar=weekly$' "$USER_UPDATE_CHECK_TIMER"
-grep -q '^WantedBy=graphical-session.target$' "$USER_UPDATE_CHECK_TIMER"
-[ ! -e "$LEGACY_SLEEP_SERVICE" ] || {
-    echo "Legacy sleep service installed unexpectedly: $LEGACY_SLEEP_SERVICE"
-    exit 1
-}
-[ ! -e "$LEGACY_WAKE_SERVICE" ] || {
-    echo "Legacy wake service installed unexpectedly: $LEGACY_WAKE_SERVICE"
-    exit 1
-}
-[ ! -e "$NM_SLEEP_HOOK" ] || {
-    echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
-    exit 1
-}
-[ ! -e "$SYSTEM_SLEEP_HOOK" ] || {
-    echo "Legacy systemd sleep hook installed unexpectedly: $SYSTEM_SLEEP_HOOK"
-    exit 1
-}
-assert_executable "$NM_LIFECYCLE_HOOK"
-grep -q 'lg-buddy nm-pre-down' "$NM_LIFECYCLE_HOOK"
+assert_lifecycle_topology_installed
 grep -q '^screen_idle_blank=enabled$' "$CONFIG_FILE"
 grep -q '^system_sleep_wake_policy=disabled$' "$CONFIG_FILE"
 

@@ -161,18 +161,24 @@ mod tests {
         }
     }
 
-    struct CompletingSleeper {
+    struct StateWritingSleeper {
         durations: RefCell<Vec<Duration>>,
         attempt_state: SystemSleepAttemptState,
         outcome: SystemSleepCycleOutcome,
+        owner: RefCell<Option<SystemSleepAttemptLock>>,
     }
 
-    impl CompletingSleeper {
-        fn new(attempt_state: SystemSleepAttemptState, outcome: SystemSleepCycleOutcome) -> Self {
+    impl StateWritingSleeper {
+        fn new(
+            attempt_state: SystemSleepAttemptState,
+            outcome: SystemSleepCycleOutcome,
+            owner: Option<SystemSleepAttemptLock>,
+        ) -> Self {
             Self {
                 durations: RefCell::new(Vec::new()),
                 attempt_state,
                 outcome,
+                owner: RefCell::new(owner),
             }
         }
 
@@ -181,41 +187,12 @@ mod tests {
         }
     }
 
-    impl Sleeper for CompletingSleeper {
+    impl Sleeper for StateWritingSleeper {
         fn sleep(&self, duration: Duration) {
             self.durations.borrow_mut().push(duration);
             self.attempt_state
                 .write_outcome(self.outcome)
                 .expect("write terminal outcome during wait");
-        }
-    }
-
-    struct RetryableReleasingSleeper {
-        durations: RefCell<Vec<Duration>>,
-        attempt_state: SystemSleepAttemptState,
-        owner: RefCell<Option<SystemSleepAttemptLock>>,
-    }
-
-    impl RetryableReleasingSleeper {
-        fn new(attempt_state: SystemSleepAttemptState, owner: SystemSleepAttemptLock) -> Self {
-            Self {
-                durations: RefCell::new(Vec::new()),
-                attempt_state,
-                owner: RefCell::new(Some(owner)),
-            }
-        }
-
-        fn durations(&self) -> Vec<Duration> {
-            self.durations.borrow().clone()
-        }
-    }
-
-    impl Sleeper for RetryableReleasingSleeper {
-        fn sleep(&self, duration: Duration) {
-            self.durations.borrow_mut().push(duration);
-            self.attempt_state
-                .write_outcome(SystemSleepCycleOutcome::RetryableTransportFailure)
-                .expect("write retryable outcome during wait");
             drop(self.owner.borrow_mut().take());
         }
     }
@@ -401,8 +378,11 @@ mod tests {
         let mock = MockBscpylgtv::new("nm-pre-down-waits-in-progress-tv");
         mock.set_input("HDMI_2");
         let client = client_for_mock(&mock);
-        let sleeper =
-            CompletingSleeper::new(attempt_state.clone(), SystemSleepCycleOutcome::Completed);
+        let sleeper = StateWritingSleeper::new(
+            attempt_state.clone(),
+            SystemSleepCycleOutcome::Completed,
+            None,
+        );
         let mut bus = FakeBus::preparing_for_sleep(true);
         let mut output = Vec::new();
 
@@ -479,7 +459,11 @@ mod tests {
         let mock = MockBscpylgtv::new("nm-pre-down-in-progress-retryable-tv");
         mock.set_input("HDMI_2");
         let client = client_for_mock(&mock);
-        let sleeper = RetryableReleasingSleeper::new(attempt_state.clone(), owner);
+        let sleeper = StateWritingSleeper::new(
+            attempt_state.clone(),
+            SystemSleepCycleOutcome::RetryableTransportFailure,
+            Some(owner),
+        );
         let mut bus = FakeBus::preparing_for_sleep(true);
         let mut output = Vec::new();
 
