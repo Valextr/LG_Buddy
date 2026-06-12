@@ -245,6 +245,17 @@ pub fn run_screen_off<W: Write>(writer: &mut W) -> Result<(), RunError> {
 }
 
 pub fn run_sleep_pre<W: Write>(writer: &mut W) -> Result<(), RunError> {
+    run_sleep_pre_for_event(
+        writer,
+        RuntimeEvent::from_command(crate::Command::SleepPre)
+            .expect("sleep-pre should map to a runtime event"),
+    )
+}
+
+pub fn run_sleep_pre_for_event<W: Write>(
+    writer: &mut W,
+    event: RuntimeEvent,
+) -> Result<(), RunError> {
     let config_path = resolve_config_path_from_env().map_err(RunError::ConfigPath)?;
     let config = load_config(&config_path).map_err(RunError::Config)?;
     let marker = ScreenOwnershipMarker::from_env(StateScope::System).map_err(RunError::StateDir)?;
@@ -261,8 +272,7 @@ pub fn run_sleep_pre<W: Write>(writer: &mut W) -> Result<(), RunError> {
         &cycle_state,
         &tv_client,
         &sleeper,
-        RuntimeEvent::from_command(crate::Command::SleepPre)
-            .expect("sleep-pre should map to a runtime event"),
+        event,
     )
 }
 
