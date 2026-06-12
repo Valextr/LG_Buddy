@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -15,6 +15,7 @@ const STATE_DIR_NAME: &str = "lg_buddy";
 pub const SCREEN_OFF_BY_US_MARKER: &str = "screen_off_by_us";
 pub const SYSTEM_SLEEP_ATTEMPTED_MARKER: &str = "system_sleep_attempted";
 pub const SYSTEM_SLEEP_ATTEMPT_LOCK: &str = "system_sleep_attempt.lock";
+pub const SYSTEM_SLEEP_CYCLE_STATE: &str = "system_sleep_cycle";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateScope {
@@ -95,13 +96,42 @@ pub fn resolve_state_dir_from_env(scope: StateScope) -> Result<PathBuf, StateDir
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemSleepAttemptState {
-    marker_path: PathBuf,
-    lock_path: PathBuf,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemSleepCycleOutcome {
+    InProgress,
+    Completed,
+    RetryableTransportFailure,
 }
 
-impl SystemSleepAttemptState {
+impl SystemSleepCycleOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::RetryableTransportFailure => "retryable_transport_failure",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "retryable_transport_failure" => Some(Self::RetryableTransportFailure),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemSleepCycleState {
+    marker_path: PathBuf,
+    lock_path: PathBuf,
+    cycle_path: PathBuf,
+}
+
+pub type SystemSleepAttemptState = SystemSleepCycleState;
+
+impl SystemSleepCycleState {
     pub fn for_scope(
         scope: StateScope,
         sources: RuntimeDirSources<'_>,
@@ -119,6 +149,7 @@ impl SystemSleepAttemptState {
         Self {
             marker_path: state_dir.join(SYSTEM_SLEEP_ATTEMPTED_MARKER),
             lock_path: state_dir.join(SYSTEM_SLEEP_ATTEMPT_LOCK),
+            cycle_path: state_dir.join(SYSTEM_SLEEP_CYCLE_STATE),
         }
     }
 
@@ -128,6 +159,10 @@ impl SystemSleepAttemptState {
 
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
+    }
+
+    pub fn cycle_path(&self) -> &Path {
+        &self.cycle_path
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -153,18 +188,55 @@ impl SystemSleepAttemptState {
         self.marker_path.is_file()
     }
 
-    pub fn try_lock(&self) -> io::Result<Option<SystemSleepAttemptLock>> {
+    pub fn read_outcome(&self) -> io::Result<Option<SystemSleepCycleOutcome>> {
+        let content = match fs::read_to_string(&self.cycle_path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        let value = content
+            .lines()
+            .find_map(|line| line.strip_prefix("outcome="))
+            .unwrap_or_else(|| content.trim());
+
+        SystemSleepCycleOutcome::from_str(value)
+            .map(Some)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown system sleep cycle outcome `{value}`"),
+                )
+            })
+    }
+
+    pub fn write_outcome(&self, outcome: SystemSleepCycleOutcome) -> io::Result<()> {
+        fs::create_dir_all(self.state_dir())?;
+        write_state_file(&self.cycle_path, &format!("outcome={}\n", outcome.as_str()))
+    }
+
+    pub fn clear_outcome(&self) -> io::Result<()> {
+        match fs::remove_file(&self.cycle_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn try_lock(&self) -> io::Result<Option<SystemSleepCycleLock>> {
         fs::create_dir_all(self.state_dir())?;
         let file = open_lock_file(&self.lock_path)?;
-        try_lock_file(file).map(|file| file.map(SystemSleepAttemptLock))
+        try_lock_file(file).map(|file| file.map(SystemSleepCycleLock))
     }
 }
 
 #[derive(Debug)]
-pub struct SystemSleepAttemptLock(File);
+pub struct SystemSleepCycleLock(File);
+
+pub type SystemSleepAttemptLock = SystemSleepCycleLock;
 
 #[cfg(unix)]
-impl Drop for SystemSleepAttemptLock {
+impl Drop for SystemSleepCycleLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -293,6 +365,22 @@ fn create_marker_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn write_state_file(path: &Path, content: &str) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(content.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_state_file(path: &Path, content: &str) -> io::Result<()> {
+    fs::write(path, content)
+}
+
+#[cfg(unix)]
 fn current_uid() -> Option<u32> {
     unsafe extern "C" {
         fn geteuid() -> u32;
@@ -310,8 +398,9 @@ fn current_uid() -> Option<u32> {
 mod tests {
     use super::{
         resolve_state_dir, RuntimeDirSources, ScreenOwnershipMarker, StateDirError, StateScope,
-        SystemSleepAttemptState, SCREEN_OFF_BY_US_MARKER, SYSTEM_SLEEP_ATTEMPTED_MARKER,
-        SYSTEM_SLEEP_ATTEMPT_LOCK,
+        SystemSleepAttemptState, SystemSleepCycleOutcome, SystemSleepCycleState,
+        SCREEN_OFF_BY_US_MARKER, SYSTEM_SLEEP_ATTEMPTED_MARKER, SYSTEM_SLEEP_ATTEMPT_LOCK,
+        SYSTEM_SLEEP_CYCLE_STATE,
     };
     use std::fs;
     #[cfg(unix)]
@@ -416,7 +505,7 @@ mod tests {
 
     #[test]
     fn system_sleep_attempt_state_uses_expected_files() {
-        let state = SystemSleepAttemptState::new(PathBuf::from("/tmp/lg-buddy-state"));
+        let state = SystemSleepCycleState::new(PathBuf::from("/tmp/lg-buddy-state"));
 
         assert_eq!(
             state.marker_path(),
@@ -425,6 +514,10 @@ mod tests {
         assert_eq!(
             state.lock_path(),
             Path::new("/tmp/lg-buddy-state").join(SYSTEM_SLEEP_ATTEMPT_LOCK)
+        );
+        assert_eq!(
+            state.cycle_path(),
+            Path::new("/tmp/lg-buddy-state").join(SYSTEM_SLEEP_CYCLE_STATE)
         );
     }
 
@@ -439,6 +532,50 @@ mod tests {
         state.clear().expect("clear attempted");
         assert!(!state.exists());
         state.clear().expect("clear missing attempted marker");
+    }
+
+    #[test]
+    fn system_sleep_cycle_outcome_round_trips_through_state_file() {
+        let temp_dir = TestDir::new("system-sleep-cycle-outcome");
+        let state = SystemSleepCycleState::new(temp_dir.path().to_path_buf());
+
+        assert_eq!(state.read_outcome().expect("read missing outcome"), None);
+
+        state
+            .write_outcome(SystemSleepCycleOutcome::InProgress)
+            .expect("write in-progress outcome");
+        assert_eq!(
+            fs::read_to_string(state.cycle_path()).expect("read outcome file"),
+            "outcome=in_progress\n"
+        );
+        assert_eq!(
+            state.read_outcome().expect("read in-progress outcome"),
+            Some(SystemSleepCycleOutcome::InProgress)
+        );
+
+        state
+            .write_outcome(SystemSleepCycleOutcome::Completed)
+            .expect("write completed outcome");
+        assert_eq!(
+            state.read_outcome().expect("read completed outcome"),
+            Some(SystemSleepCycleOutcome::Completed)
+        );
+
+        state.clear_outcome().expect("clear outcome");
+        assert_eq!(state.read_outcome().expect("read cleared outcome"), None);
+    }
+
+    #[test]
+    fn system_sleep_cycle_outcome_rejects_unknown_value() {
+        let temp_dir = TestDir::new("system-sleep-cycle-bad-outcome");
+        let state = SystemSleepCycleState::new(temp_dir.path().to_path_buf());
+        fs::write(state.cycle_path(), "outcome=maybe\n").expect("write bad outcome");
+
+        let err = state
+            .read_outcome()
+            .expect_err("bad cycle outcome should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
