@@ -28,6 +28,7 @@ const SYSTEM_PRE_SLEEP_POWER_OFF_ATTEMPTS: u32 = 1;
 const SYSTEM_SLEEP_GET_INPUT_RETRIES: u32 = 3;
 const SYSTEM_SLEEP_POWER_OFF_RETRIES: u32 = 4;
 const SYSTEM_SLEEP_RAIL_DEADLINE: Duration = Duration::from_secs(4);
+const SYSTEM_SLEEP_RAIL_WAIT_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) trait Sleeper {
     fn sleep(&self, duration: Duration);
@@ -232,6 +233,12 @@ pub(crate) enum SuspendRailDisposition {
     JoinedInProgress,
     DuplicateCompleted,
     RetryableFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemSleepCycleWait {
+    Terminal(SystemSleepCycleOutcome),
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -988,6 +995,7 @@ pub(crate) fn handle_system_suspend_with<W: Write, C: TvClient, Sl: Sleeper>(
     .map(|_| ())
 }
 
+#[cfg(test)]
 pub(crate) fn attempt_system_sleep_power_off_once_with_outcome<
     W: Write,
     C: TvClient,
@@ -1062,14 +1070,24 @@ pub(crate) fn handle_network_teardown_with_outcome<W: Write, C: TvClient, Sl: Sl
                 "LG Buddy NetworkManager: logind is preparing for sleep; running pre-sleep TV handling before network teardown."
             )?;
             outcome.merge(decision.outcome);
-            outcome.merge(attempt_system_sleep_power_off_once_with_outcome(
+            let (rail_outcome, rail_disposition) = handle_system_suspend_with_outcome(
                 writer,
                 config,
                 deps.marker,
                 deps.attempt_state,
                 deps.tv_client,
                 deps.sleeper,
-            )?);
+                event,
+            )?;
+            outcome.merge(rail_outcome);
+            handle_network_teardown_rail_disposition(
+                writer,
+                config,
+                deps,
+                event,
+                rail_disposition,
+                &mut outcome,
+            )?;
         }
         NetworkTeardownNext::ClearAttempt => {
             outcome.merge(decision.outcome);
@@ -1094,6 +1112,94 @@ pub(crate) fn handle_network_teardown_with_outcome<W: Write, C: TvClient, Sl: Sl
     }
 
     Ok(outcome)
+}
+
+fn handle_network_teardown_rail_disposition<W: Write, C: TvClient, Sl: Sleeper>(
+    writer: &mut W,
+    config: &Config,
+    deps: NetworkTeardownDeps<'_, C, Sl>,
+    event: RuntimeEvent,
+    disposition: SuspendRailDisposition,
+    outcome: &mut PolicyOutcome,
+) -> Result<(), RunError> {
+    if disposition != SuspendRailDisposition::JoinedInProgress {
+        return Ok(());
+    }
+
+    match wait_for_system_sleep_cycle_terminal(
+        deps.attempt_state,
+        deps.sleeper,
+        system_sleep_rail_deadline(),
+    )? {
+        SystemSleepCycleWait::Terminal(SystemSleepCycleOutcome::Completed) => {
+            writeln!(
+                writer,
+                "LG Buddy NetworkManager: suspend rail completed; releasing network teardown."
+            )?;
+        }
+        SystemSleepCycleWait::Terminal(SystemSleepCycleOutcome::RetryableTransportFailure) => {
+            writeln!(
+                writer,
+                "LG Buddy NetworkManager: suspend rail reported retryable transport failure; retrying before network teardown."
+            )?;
+            let (retry_outcome, _) = handle_system_suspend_with_outcome(
+                writer,
+                config,
+                deps.marker,
+                deps.attempt_state,
+                deps.tv_client,
+                deps.sleeper,
+                event,
+            )?;
+            outcome.merge(retry_outcome);
+        }
+        SystemSleepCycleWait::Terminal(SystemSleepCycleOutcome::InProgress)
+        | SystemSleepCycleWait::TimedOut => {
+            writeln!(
+                writer,
+                "LG Buddy NetworkManager: suspend rail did not finish before deadline; releasing network teardown."
+            )?;
+            outcome.diagnostics.push(Diagnostic::warning(
+                "suspend rail did not finish before NetworkManager teardown deadline",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn wait_for_system_sleep_cycle_terminal<Sl: Sleeper>(
+    cycle_state: &SystemSleepAttemptState,
+    sleeper: &Sl,
+    deadline: Duration,
+) -> Result<SystemSleepCycleWait, RunError> {
+    let mut waited = Duration::ZERO;
+    let poll = system_sleep_rail_wait_poll();
+
+    loop {
+        match cycle_state.read_outcome()? {
+            Some(SystemSleepCycleOutcome::Completed) => {
+                return Ok(SystemSleepCycleWait::Terminal(
+                    SystemSleepCycleOutcome::Completed,
+                ));
+            }
+            Some(SystemSleepCycleOutcome::RetryableTransportFailure) => {
+                return Ok(SystemSleepCycleWait::Terminal(
+                    SystemSleepCycleOutcome::RetryableTransportFailure,
+                ));
+            }
+            Some(SystemSleepCycleOutcome::InProgress) | None => {}
+        }
+
+        if waited >= deadline {
+            return Ok(SystemSleepCycleWait::TimedOut);
+        }
+
+        let remaining = deadline.saturating_sub(waited);
+        let sleep_for = poll.min(remaining);
+        sleeper.sleep(sleep_for);
+        waited += sleep_for;
+    }
 }
 
 pub(crate) fn attempt_legacy_network_manager_sleep_with<
@@ -1627,6 +1733,15 @@ pub(crate) fn system_sleep_rail_deadline() -> Duration {
         "LG_BUDDY_SYSTEM_SLEEP_RAIL_DEADLINE_SECS",
         SYSTEM_SLEEP_RAIL_DEADLINE,
     )
+}
+
+fn system_sleep_rail_wait_poll() -> Duration {
+    env::var("LG_BUDDY_SYSTEM_SLEEP_RAIL_WAIT_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(SYSTEM_SLEEP_RAIL_WAIT_POLL)
 }
 
 fn tv_route_wait_attempts() -> u32 {

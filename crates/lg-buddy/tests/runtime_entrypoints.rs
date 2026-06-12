@@ -379,13 +379,13 @@ fn run_nm_pre_down_uses_logind_property_and_retries_idempotently() {
             .iter()
             .map(|call| call.command.as_str())
             .collect::<Vec<_>>(),
-        vec!["get_input", "power_off", "get_input", "power_off"]
+        vec!["get_input", "power_off"]
     );
     runtime.assert_system_marker_exists();
     runtime.assert_system_sleep_attempt_marker_absent();
     assert!(String::from_utf8(second_output)
         .expect("utf8 output")
-        .contains("Could not query TV input"));
+        .contains("logind is preparing for sleep"));
 }
 
 #[test]
