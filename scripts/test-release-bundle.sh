@@ -112,6 +112,8 @@ assert_executable "$BUNDLE_DIR/bin/LG_Buddy_Common"
 assert_file "$BUNDLE_DIR/LG_Buddy_Brightness.desktop"
 assert_file "$BUNDLE_DIR/README.md"
 assert_file "$BUNDLE_DIR/LICENSE"
+assert_file "$BUNDLE_DIR/docs/architecture-overview.md"
+assert_file "$BUNDLE_DIR/docs/runtime-event-handler-map.md"
 assert_file "$BUNDLE_DIR/docs/user-guide.md"
 assert_file "$BUNDLE_DIR/docs/development.md"
 assert_file "$BUNDLE_DIR/docs/release-process.md"
@@ -167,6 +169,7 @@ SYSTEM_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy.service"
 LIFECYCLE_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_lifecycle.service"
 LEGACY_SLEEP_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_sleep.service"
 LEGACY_WAKE_SERVICE="$INSTALL_ROOT/etc/systemd/system/LG_Buddy_wake.service"
+SYSTEM_SLEEP_HOOK="$INSTALL_ROOT/usr/lib/systemd/system-sleep/LG_Buddy_sleep_hook"
 USER_SCREEN_SERVICE="$HOME/.config/systemd/user/LG_Buddy_screen.service"
 USER_UPDATE_CHECK_SERVICE="$HOME/.config/systemd/user/LG_Buddy_update_check.service"
 USER_UPDATE_CHECK_TIMER="$HOME/.config/systemd/user/LG_Buddy_update_check.timer"
@@ -185,6 +188,7 @@ assert_executable "$INSTALLED_VENV_PIP"
 assert_file "$INSTALLED_POINTER"
 assert_file "$SYSTEM_SERVICE"
 assert_file "$LIFECYCLE_SERVICE"
+grep -q 'ExecStart=/usr/bin/lg-buddy lifecycle' "$LIFECYCLE_SERVICE"
 assert_file "$USER_SCREEN_SERVICE"
 assert_file "$USER_UPDATE_CHECK_SERVICE"
 assert_file "$USER_UPDATE_CHECK_TIMER"
@@ -204,6 +208,10 @@ assert_file "$DESKTOP_ENTRY"
     echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
     exit 1
 }
+[ ! -e "$SYSTEM_SLEEP_HOOK" ] || {
+    echo "Legacy systemd sleep hook installed unexpectedly: $SYSTEM_SLEEP_HOOK"
+    exit 1
+}
 assert_executable "$NM_LIFECYCLE_HOOK"
 grep -q 'lg-buddy nm-pre-down' "$NM_LIFECYCLE_HOOK"
 if grep -q 'LG_BUDDY_CONFIG' "$NM_LIFECYCLE_HOOK"; then
@@ -218,6 +226,9 @@ grep -q '^screen_idle_blank=enabled$' "$CONFIG_FILE"
 grep -q '^screen_backend=auto$' "$CONFIG_FILE"
 grep -q '^system_sleep_wake_policy=enabled$' "$CONFIG_FILE"
 grep -q "$CONFIG_FILE" "$INSTALLED_POINTER"
+grep -q 'cooperating suspend sources' "$BUNDLE_DIR/README.md"
+grep -q 'cooperative suspend rail' "$BUNDLE_DIR/docs/architecture-overview.md"
+grep -q 'NetworkManager and logind cooperate through one suspend rail' "$BUNDLE_DIR/docs/runtime-event-handler-map.md"
 
 if [ "$SKIP_PIP_INSTALL" -eq 0 ]; then
     assert_executable "$INSTALLED_BSCPYLGTV"
@@ -332,6 +343,10 @@ export LG_BUDDY_REMOVE_CONFIG="1"
     echo "NetworkManager sleep hook still present after uninstall: $NM_SLEEP_HOOK"
     exit 1
 }
+[ ! -e "$SYSTEM_SLEEP_HOOK" ] || {
+    echo "Legacy systemd sleep hook still present after uninstall: $SYSTEM_SLEEP_HOOK"
+    exit 1
+}
 [ ! -e "$NM_LIFECYCLE_HOOK" ] || {
     echo "NetworkManager lifecycle hook still present after uninstall: $NM_LIFECYCLE_HOOK"
     exit 1
@@ -358,6 +373,7 @@ assert_executable "$INSTALLED_BINARY"
 }
 assert_file "$SYSTEM_SERVICE"
 assert_file "$LIFECYCLE_SERVICE"
+grep -q 'ExecStart=/usr/bin/lg-buddy lifecycle' "$LIFECYCLE_SERVICE"
 assert_file "$USER_SCREEN_SERVICE"
 assert_file "$USER_UPDATE_CHECK_SERVICE"
 assert_file "$USER_UPDATE_CHECK_TIMER"
@@ -374,6 +390,10 @@ grep -q '^WantedBy=graphical-session.target$' "$USER_UPDATE_CHECK_TIMER"
 }
 [ ! -e "$NM_SLEEP_HOOK" ] || {
     echo "NetworkManager sleep hook installed unexpectedly: $NM_SLEEP_HOOK"
+    exit 1
+}
+[ ! -e "$SYSTEM_SLEEP_HOOK" ] || {
+    echo "Legacy systemd sleep hook installed unexpectedly: $SYSTEM_SLEEP_HOOK"
     exit 1
 }
 assert_executable "$NM_LIFECYCLE_HOOK"

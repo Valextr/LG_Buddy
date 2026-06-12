@@ -38,9 +38,9 @@ same normalized inactivity observations.
 | --- | --- | --- | --- |
 | system boot / service start | `lg-buddy startup boot` | `commands` -> `lifecycle` | Send Wake-on-LAN and restore the configured input. |
 | system shutdown / service stop | `lg-buddy shutdown` | `commands` -> `lifecycle` | Power off the TV when the configured input is active, unless a reboot is pending. |
-| NetworkManager `pre-down` while logind `PreparingForSleep=true` | `lg-buddy nm-pre-down` | `sources::linux::network_manager` -> `lifecycle` | Run pre-sleep TV power-off under a process lock before network teardown. |
-| logind `PrepareForSleep(true)` | `lg-buddy lifecycle` | `session::runner` | Log diagnostic sleep intent; do not run TV network I/O. |
-| logind `PrepareForSleep(false)` | `lg-buddy lifecycle` | `sources::linux::logind` -> `session::runner` -> `lifecycle` | Run wake restore policy and clear stale legacy system sleep attempt state. |
+| NetworkManager `pre-down` while logind `PreparingForSleep=true` | `lg-buddy nm-pre-down` | `sources::linux::network_manager` -> `lifecycle` | Join the central suspend rail before network teardown; wait for an in-progress logind rail or run the pre-sleep TV decision. |
+| logind `PrepareForSleep(true)` | `lg-buddy lifecycle` | `sources::linux::logind` -> `session::runner` -> `lifecycle` | Enter the central suspend rail under the logind delay inhibitor so systems without a NetworkManager `pre-down` hook still get bounded pre-sleep TV handling. |
+| logind `PrepareForSleep(false)` | `lg-buddy lifecycle` | `sources::linux::logind` -> `session::runner` -> `lifecycle` | Run wake restore policy and clear sleep-cycle coordination state. |
 | user graphical session start | `lg-buddy monitor` | `session::runner::run_monitor` | Detect the session backend and run the selected monitor path. |
 | manual screen blank | `lg-buddy screen-off` | `commands` -> `screen` | Blank or power off the TV if LG Buddy owns the configured input. |
 | manual screen restore | `lg-buddy screen-on` | `commands` -> `screen` | Restore the screen when marker and restore-policy rules allow it. |
@@ -165,7 +165,12 @@ cooperating Linux event sources:
 NetworkManager pre-down
   -> lg-buddy nm-pre-down
   -> logind PreparingForSleep property read
-  -> lifecycle policy
+  -> cooperative suspend rail
+  -> TV action executor
+
+org.freedesktop.login1 PrepareForSleep(true)
+  -> lg-buddy lifecycle
+  -> cooperative suspend rail
   -> TV action executor
 
 org.freedesktop.login1 PrepareForSleep(false)
@@ -175,17 +180,21 @@ org.freedesktop.login1 PrepareForSleep(false)
   -> TV action executor
 ```
 
-The NetworkManager pre-down gate is the only default pre-sleep TV power-off
-owner. It reads logind `PreparingForSleep` synchronously; false or read failure
-returns quickly, true runs the idempotent pre-sleep policy under a process lock
-while NetworkManager is still holding interface teardown.
+NetworkManager and logind cooperate through one suspend rail. NetworkManager
+`pre-down` remains the strongest network-up opportunity: it reads logind
+`PreparingForSleep` synchronously; false or read failure returns quickly, true
+enters the rail while NetworkManager is still holding interface teardown. If
+logind already owns the rail, NetworkManager waits for a terminal outcome or a
+bounded timeout before releasing teardown.
 
-The lifecycle service subscribes to logind manager signals on the system bus.
-`PrepareForSleep(true)` is diagnostic only. `PrepareForSleep(false)` runs wake
-restore policy and clears stale legacy system sleep attempt state.
+The lifecycle service subscribes to logind manager signals on the system bus and
+holds a sleep delay inhibitor while idle. `PrepareForSleep(true)` enters the
+same suspend rail so systems without a NetworkManager `pre-down` hook still get
+a bounded pre-sleep TV decision. `PrepareForSleep(false)` runs wake restore
+policy and clears per-cycle coordination state.
 
-The installer must not leave a second lifecycle owner active. It removes or
-disables these legacy artifacts during install and uninstall:
+The installer must not leave old lifecycle owners active. It removes or disables
+these legacy artifacts during install and uninstall:
 
 - `LG_Buddy_sleep.service`
 - `LG_Buddy_wake.service`
@@ -198,7 +207,7 @@ Current lifecycle signal mapping:
 | logind surface | Canonical event | Runtime action |
 | --- | --- | --- |
 | `PreparingForSleep` property | `NetworkTeardownImminent { machine_sleep_pending }` in the NetworkManager source path; `RuntimePhaseRead` in screen eligibility | Gate pre-sleep policy and block session screen TV I/O during pending machine sleep. |
-| `PrepareForSleep(true)` | `MachinePreparingForSleep` | Diagnostic log only. |
+| `PrepareForSleep(true)` | `MachinePreparingForSleep` | `run_sleep_pre_for_event` through the central suspend rail. |
 | `PrepareForSleep(false)` | `MachineResumed` | `run_system_resume` |
 
 The current `SessionEventDispatcher` handles these session events when a
@@ -234,10 +243,9 @@ lifecycle path:
 - users who do not want automatic sleep/wake TV control opt out through
   `system_sleep_wake_policy=disabled`
 - default installs do not ask whether lifecycle automation should run
-- the NetworkManager pre-down gate is the only default pre-sleep TV power-off
-  owner
-- logind `PrepareForSleep(true)` is diagnostic; logind
-  `PrepareForSleep(false)` owns resume restore
+- NetworkManager `pre-down` and logind `PrepareForSleep(true)` cooperate through
+  one central suspend rail
+- logind `PrepareForSleep(false)` owns resume restore and per-cycle cleanup
 - legacy systemd and old NetworkManager sleep/wake handlers are cleanup targets,
   not parallel runtime handlers
 - legacy cleanup honors a persisted opt-out config value

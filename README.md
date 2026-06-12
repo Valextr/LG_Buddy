@@ -97,7 +97,7 @@ chmod +x ./install.sh
 ./install.sh
 ```
 
-The installer will prompt for your TV IP, MAC address, HDMI input, and session idle blanking details, then install the required services. System sleep/wake handling uses the default lifecycle service plus NetworkManager pre-down gate unless you opt out in `config.env`.
+The installer will prompt for your TV IP, MAC address, HDMI input, and session idle blanking details, then install the required services. System sleep/wake handling uses the lifecycle service plus NetworkManager pre-down gate as cooperating suspend sources unless you opt out in `config.env`.
 
 On first use, you may need to accept a pairing prompt on the TV:
 
