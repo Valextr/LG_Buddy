@@ -384,12 +384,28 @@ pub fn run_system_resume<W: Write>(writer: &mut W) -> Result<(), RunError> {
         &network_waiter,
     );
 
+    let mut cleanup_error = None;
+
     if let Err(err) = attempt_state.clear() {
         writeln!(
             writer,
             "LG Buddy System Resume: could not clear system sleep attempt marker after resume. {err}"
         )?;
-        if result.is_ok() {
+        cleanup_error = Some(err);
+    }
+
+    if let Err(err) = attempt_state.clear_outcome() {
+        writeln!(
+            writer,
+            "LG Buddy System Resume: could not clear system sleep cycle state after resume. {err}"
+        )?;
+        if cleanup_error.is_none() {
+            cleanup_error = Some(err);
+        }
+    }
+
+    if result.is_ok() {
+        if let Some(err) = cleanup_error {
             return Err(RunError::Io(err));
         }
     }
