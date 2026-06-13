@@ -397,7 +397,7 @@ mod tests {
         )
         .expect("pre-down should wait for in-progress rail");
 
-        assert!(sleeper.durations().len() >= 1);
+        assert!(!sleeper.durations().is_empty());
         assert_eq!(
             attempt_state.read_outcome().expect("read cycle outcome"),
             Some(SystemSleepCycleOutcome::Completed)
