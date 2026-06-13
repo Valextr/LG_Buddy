@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::{Duration, SystemTime};
 
 const STATE_DIR_NAME: &str = "lg_buddy";
@@ -364,20 +365,54 @@ fn create_marker_file(path: &Path) -> io::Result<()> {
     fs::write(path, [])
 }
 
-#[cfg(unix)]
 fn write_state_file(path: &Path, content: &str) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(content.as_bytes())
+    let mut last_error = None;
+    for attempt in 0..100 {
+        let temp_path = state_temp_path(path, attempt);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+
+        let mut file = match options.open(&temp_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        let result = (|| {
+            file.write_all(content.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, path)
+        })();
+
+        if let Err(err) = result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err);
+        }
+
+        return Ok(());
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create unique state temporary file",
+        )
+    }))
 }
 
-#[cfg(not(unix))]
-fn write_state_file(path: &Path, content: &str) -> io::Result<()> {
-    fs::write(path, content)
+fn state_temp_path(path: &Path, attempt: u8) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    path.with_file_name(format!(".{file_name}.{}.{}.tmp", process::id(), attempt))
 }
 
 #[cfg(unix)]
@@ -397,10 +432,10 @@ fn current_uid() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_state_dir, RuntimeDirSources, ScreenOwnershipMarker, StateDirError, StateScope,
-        SystemSleepAttemptState, SystemSleepCycleOutcome, SystemSleepCycleState,
-        SCREEN_OFF_BY_US_MARKER, SYSTEM_SLEEP_ATTEMPTED_MARKER, SYSTEM_SLEEP_ATTEMPT_LOCK,
-        SYSTEM_SLEEP_CYCLE_STATE,
+        resolve_state_dir, state_temp_path, RuntimeDirSources, ScreenOwnershipMarker,
+        StateDirError, StateScope, SystemSleepAttemptState, SystemSleepCycleOutcome,
+        SystemSleepCycleState, SCREEN_OFF_BY_US_MARKER, SYSTEM_SLEEP_ATTEMPTED_MARKER,
+        SYSTEM_SLEEP_ATTEMPT_LOCK, SYSTEM_SLEEP_CYCLE_STATE,
     };
     use std::fs;
     #[cfg(unix)]
@@ -563,6 +598,34 @@ mod tests {
 
         state.clear_outcome().expect("clear outcome");
         assert_eq!(state.read_outcome().expect("read cleared outcome"), None);
+    }
+
+    #[test]
+    fn system_sleep_cycle_outcome_failed_atomic_write_preserves_existing_file() {
+        let temp_dir = TestDir::new("system-sleep-cycle-atomic-failure");
+        let state = SystemSleepCycleState::new(temp_dir.path().to_path_buf());
+
+        state
+            .write_outcome(SystemSleepCycleOutcome::InProgress)
+            .expect("write initial outcome");
+        for attempt in 0..100 {
+            fs::write(state_temp_path(state.cycle_path(), attempt), "occupied")
+                .expect("occupy atomic temp path");
+        }
+
+        let err = state
+            .write_outcome(SystemSleepCycleOutcome::Completed)
+            .expect_err("colliding temp paths should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(state.cycle_path()).expect("read preserved outcome file"),
+            "outcome=in_progress\n"
+        );
+        assert_eq!(
+            state.read_outcome().expect("read preserved outcome"),
+            Some(SystemSleepCycleOutcome::InProgress)
+        );
     }
 
     #[test]

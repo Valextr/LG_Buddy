@@ -352,11 +352,13 @@ fn run_lifecycle_monitor_with_bus<W: Write, E: SessionActionExecutor>(
     )?;
 
     let mut sleep_inhibitor = None;
-    acquire_lifecycle_sleep_delay_inhibitor_if_enabled(
+    let mut waiting_for_resume = false;
+    sync_lifecycle_sleep_delay_inhibitor_if_idle(
         writer,
         bus,
         config_path,
         &mut sleep_inhibitor,
+        waiting_for_resume,
     )?;
 
     let started = Instant::now();
@@ -378,6 +380,14 @@ fn run_lifecycle_monitor_with_bus<W: Write, E: SessionActionExecutor>(
                 .min(timeout.saturating_sub(started.elapsed()));
         }
 
+        sync_lifecycle_sleep_delay_inhibitor_if_idle(
+            writer,
+            bus,
+            config_path,
+            &mut sleep_inhibitor,
+            waiting_for_resume,
+        )?;
+
         let Some(signal) =
             bus.process(process_timeout)
                 .map_err(|err| SessionRunnerError::Failed {
@@ -393,6 +403,12 @@ fn run_lifecycle_monitor_with_bus<W: Write, E: SessionActionExecutor>(
         };
 
         let event_kind = LifecycleEvent::from_runtime_event(event);
+        match event_kind {
+            Some(LifecycleEvent::MachinePreparingForSleep) => waiting_for_resume = true,
+            Some(LifecycleEvent::MachineResumed) => waiting_for_resume = false,
+            _ => {}
+        }
+
         if !lifecycle_policy_enabled_from_config(config_path)? {
             release_lifecycle_sleep_delay_inhibitor(writer, &mut sleep_inhibitor)?;
             writeln!(
@@ -409,11 +425,12 @@ fn run_lifecycle_monitor_with_bus<W: Write, E: SessionActionExecutor>(
         match event_kind {
             Some(LifecycleEvent::MachineResumed) => {
                 dispatcher.dispatch_lifecycle_event(writer, event)?;
-                acquire_lifecycle_sleep_delay_inhibitor_if_enabled(
+                sync_lifecycle_sleep_delay_inhibitor_if_idle(
                     writer,
                     bus,
                     config_path,
                     &mut sleep_inhibitor,
+                    waiting_for_resume,
                 )?;
             }
             Some(LifecycleEvent::MachinePreparingForSleep) => {
@@ -436,13 +453,19 @@ fn run_lifecycle_monitor_with_bus<W: Write, E: SessionActionExecutor>(
     }
 }
 
-fn acquire_lifecycle_sleep_delay_inhibitor_if_enabled<W: Write>(
+fn sync_lifecycle_sleep_delay_inhibitor_if_idle<W: Write>(
     writer: &mut W,
     bus: &mut impl SessionBusClient,
     config_path: &Path,
     sleep_inhibitor: &mut Option<OwnedFd>,
+    waiting_for_resume: bool,
 ) -> Result<(), SessionRunnerError> {
-    if sleep_inhibitor.is_some() || !lifecycle_policy_enabled_from_config(config_path)? {
+    if !lifecycle_policy_enabled_from_config(config_path)? {
+        release_lifecycle_sleep_delay_inhibitor(writer, sleep_inhibitor)?;
+        return Ok(());
+    }
+
+    if waiting_for_resume || sleep_inhibitor.is_some() {
         return Ok(());
     }
 
@@ -1572,6 +1595,7 @@ mod tests {
         method_calls: Vec<(String, String, String, String)>,
         inhibitor_write_fds: Vec<i32>,
         disable_config_after_signals: Option<PathBuf>,
+        enable_config_after_idle: Option<PathBuf>,
     }
 
     impl SessionBusClient for FakeSessionBus {
@@ -1635,6 +1659,9 @@ mod tests {
 
             if let Some(config_path) = self.disable_config_after_signals.take() {
                 write_lifecycle_config(&config_path, "disabled");
+            }
+            if let Some(config_path) = self.enable_config_after_idle.take() {
+                write_lifecycle_config(&config_path, "enabled");
             }
 
             Ok(None)
@@ -1806,6 +1833,7 @@ system_sleep_wake_policy={policy}
             method_calls: Vec::new(),
             inhibitor_write_fds: Vec::new(),
             disable_config_after_signals: Some(config_path.clone()),
+            enable_config_after_idle: None,
         };
         let mut output = Vec::new();
 
@@ -1854,6 +1882,7 @@ system_sleep_wake_policy={policy}
             method_calls: Vec::new(),
             inhibitor_write_fds: Vec::new(),
             disable_config_after_signals: None,
+            enable_config_after_idle: None,
         };
         let mut output = Vec::new();
 
@@ -1869,6 +1898,45 @@ system_sleep_wake_policy={policy}
         assert!(bus.method_calls.is_empty());
         fs::remove_file(config_path).expect("remove lifecycle test config");
         std::env::remove_var(super::LIFECYCLE_MONITOR_TEST_EVENT_LIMIT_ENV);
+    }
+
+    #[test]
+    fn lifecycle_monitor_reacquires_inhibitor_when_policy_is_reenabled_while_idle() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(super::LIFECYCLE_MONITOR_TEST_TIMEOUT_SECS_ENV, "0.2");
+
+        let config_path = unique_config_path("lifecycle-reenabled");
+        write_lifecycle_config(&config_path, "disabled");
+        let executor = FakeActionExecutor::default();
+        let mut bus = FakeLifecycleBus {
+            signals: VecDeque::new(),
+            signal_match_count: 0,
+            method_calls: Vec::new(),
+            inhibitor_write_fds: Vec::new(),
+            disable_config_after_signals: None,
+            enable_config_after_idle: Some(config_path.clone()),
+        };
+        let mut output = Vec::new();
+
+        run_lifecycle_monitor_with_bus(&mut output, executor, &config_path, &mut bus)
+            .expect("lifecycle loop exits cleanly after test timeout");
+
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("Using logind system lifecycle source"));
+        assert!(output.contains("Acquired logind sleep delay inhibitor"));
+        assert_eq!(bus.signal_match_count, 1);
+        assert_eq!(
+            bus.method_calls
+                .iter()
+                .map(|(_, _, _, member)| member.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Inhibit"]
+        );
+        assert!(bus.enable_config_after_idle.is_none());
+        fs::remove_file(config_path).expect("remove lifecycle test config");
+        std::env::remove_var(super::LIFECYCLE_MONITOR_TEST_TIMEOUT_SECS_ENV);
     }
 
     #[test]
