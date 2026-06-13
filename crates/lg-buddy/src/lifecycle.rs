@@ -13,7 +13,8 @@ use crate::policy::{
     StateTransition, TransitionReason, TransitionReasonCode,
 };
 use crate::state::{
-    ScreenOwnershipMarker, SystemSleepAttemptState, SystemSleepCycleOutcome, SystemSleepCycleState,
+    ScreenOwnershipMarker, SystemSleepAttemptLock, SystemSleepAttemptState,
+    SystemSleepCycleOutcome, SystemSleepCycleState,
 };
 use crate::tv::{CurrentInput, TvClient, TvDevice};
 use crate::wol::{WakeOnLanSender, DEFAULT_WOL_PORT};
@@ -233,6 +234,12 @@ pub(crate) enum SuspendRailDisposition {
     JoinedInProgress,
     DuplicateCompleted,
     RetryableFailure,
+}
+
+enum SystemSleepCycleObservation {
+    Completed,
+    RetryableTransportFailure(SystemSleepAttemptLock),
+    InProgress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,16 +931,35 @@ pub(crate) fn handle_system_suspend_with_outcome<W: Write, C: TvClient, Sl: Slee
         ));
         let disposition = match cycle_state.read_outcome()? {
             Some(SystemSleepCycleOutcome::Completed) => SuspendRailDisposition::DuplicateCompleted,
-            Some(SystemSleepCycleOutcome::RetryableTransportFailure) => {
-                SuspendRailDisposition::RetryableFailure
-            }
-            Some(SystemSleepCycleOutcome::InProgress) | None => {
-                SuspendRailDisposition::JoinedInProgress
-            }
+            Some(
+                SystemSleepCycleOutcome::RetryableTransportFailure
+                | SystemSleepCycleOutcome::InProgress,
+            )
+            | None => SuspendRailDisposition::JoinedInProgress,
         };
         return Ok((outcome, disposition));
     };
 
+    handle_system_suspend_owner_with_outcome(
+        writer,
+        config,
+        marker,
+        cycle_state,
+        tv_client,
+        sleeper,
+        _guard,
+    )
+}
+
+fn handle_system_suspend_owner_with_outcome<W: Write, C: TvClient, Sl: Sleeper>(
+    writer: &mut W,
+    config: &Config,
+    marker: &ScreenOwnershipMarker,
+    cycle_state: &SystemSleepCycleState,
+    tv_client: &C,
+    sleeper: &Sl,
+    _guard: SystemSleepAttemptLock,
+) -> Result<(PolicyOutcome, SuspendRailDisposition), RunError> {
     if matches!(
         cycle_state.read_outcome()?,
         Some(SystemSleepCycleOutcome::Completed)
@@ -1078,7 +1104,6 @@ pub(crate) fn handle_network_teardown_with_outcome<W: Write, C: TvClient, Sl: Sl
                 writer,
                 config,
                 deps,
-                event,
                 rail_disposition,
                 &mut outcome,
             )?;
@@ -1112,7 +1137,6 @@ fn handle_network_teardown_rail_disposition<W: Write, C: TvClient, Sl: Sleeper>(
     writer: &mut W,
     config: &Config,
     deps: NetworkTeardownDeps<'_, C, Sl>,
-    event: RuntimeEvent,
     disposition: SuspendRailDisposition,
     outcome: &mut PolicyOutcome,
 ) -> Result<(), RunError> {
@@ -1120,34 +1144,34 @@ fn handle_network_teardown_rail_disposition<W: Write, C: TvClient, Sl: Sleeper>(
         return Ok(());
     }
 
-    match wait_for_system_sleep_cycle_outcome(
+    match wait_for_system_sleep_cycle_observation(
         deps.attempt_state,
         deps.sleeper,
         system_sleep_rail_deadline(),
     )? {
-        SystemSleepCycleOutcome::Completed => {
+        SystemSleepCycleObservation::Completed => {
             writeln!(
                 writer,
                 "LG Buddy NetworkManager: suspend rail completed; releasing network teardown."
             )?;
         }
-        SystemSleepCycleOutcome::RetryableTransportFailure => {
+        SystemSleepCycleObservation::RetryableTransportFailure(guard) => {
             writeln!(
                 writer,
                 "LG Buddy NetworkManager: suspend rail reported retryable transport failure; retrying before network teardown."
             )?;
-            let (retry_outcome, _) = handle_system_suspend_with_outcome(
+            let (retry_outcome, _) = handle_system_suspend_owner_with_outcome(
                 writer,
                 config,
                 deps.marker,
                 deps.attempt_state,
                 deps.tv_client,
                 deps.sleeper,
-                event,
+                guard,
             )?;
             outcome.merge(retry_outcome);
         }
-        SystemSleepCycleOutcome::InProgress => {
+        SystemSleepCycleObservation::InProgress => {
             writeln!(
                 writer,
                 "LG Buddy NetworkManager: suspend rail did not finish before deadline; releasing network teardown."
@@ -1161,26 +1185,30 @@ fn handle_network_teardown_rail_disposition<W: Write, C: TvClient, Sl: Sleeper>(
     Ok(())
 }
 
-fn wait_for_system_sleep_cycle_outcome<Sl: Sleeper>(
+fn wait_for_system_sleep_cycle_observation<Sl: Sleeper>(
     cycle_state: &SystemSleepAttemptState,
     sleeper: &Sl,
     deadline: Duration,
-) -> Result<SystemSleepCycleOutcome, RunError> {
+) -> Result<SystemSleepCycleObservation, RunError> {
     let mut waited = Duration::ZERO;
 
     loop {
         match cycle_state.read_outcome()? {
-            Some(
-                outcome @ (SystemSleepCycleOutcome::Completed
-                | SystemSleepCycleOutcome::RetryableTransportFailure),
-            ) => {
-                return Ok(outcome);
+            Some(SystemSleepCycleOutcome::Completed) => {
+                return Ok(SystemSleepCycleObservation::Completed);
+            }
+            Some(SystemSleepCycleOutcome::RetryableTransportFailure) => {
+                if let Some(guard) = cycle_state.try_lock()? {
+                    return Ok(SystemSleepCycleObservation::RetryableTransportFailure(
+                        guard,
+                    ));
+                }
             }
             Some(SystemSleepCycleOutcome::InProgress) | None => {}
         }
 
         if waited >= deadline {
-            return Ok(SystemSleepCycleOutcome::InProgress);
+            return Ok(SystemSleepCycleObservation::InProgress);
         }
 
         let remaining = deadline.saturating_sub(waited);
@@ -1808,8 +1836,8 @@ mod tests {
         TransitionReasonCode,
     };
     use crate::state::{
-        ScreenOwnershipMarker, SystemSleepAttemptState, SystemSleepCycleOutcome,
-        SystemSleepCycleState,
+        ScreenOwnershipMarker, SystemSleepAttemptLock, SystemSleepAttemptState,
+        SystemSleepCycleOutcome, SystemSleepCycleState,
     };
     use crate::tv::{BscpylgtvCommandClient, CurrentInput};
     use crate::wol::{WakeOnLanError, WakeOnLanSender};
@@ -2451,6 +2479,59 @@ mod tests {
     }
 
     #[test]
+    fn network_teardown_waits_for_retryable_owner_before_retrying() {
+        let temp_dir = TestDir::new("lifecycle-nm-retryable-owner");
+        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
+        let attempt_state = SystemSleepAttemptState::new(temp_dir.path().to_path_buf());
+        let owner = attempt_state
+            .try_lock()
+            .expect("acquire owner lock")
+            .expect("owner lock should be available");
+        attempt_state
+            .write_outcome(SystemSleepCycleOutcome::RetryableTransportFailure)
+            .expect("write retryable outcome");
+        let mock = MockBscpylgtv::new("lifecycle-nm-retryable-owner-tv");
+        mock.set_input("HDMI_2");
+        let client = client_for_mock(&mock);
+        let sleeper = ReleasingSleeper::new(owner);
+
+        let mut output = Vec::new();
+        let outcome = handle_network_teardown_with_outcome(
+            &mut output,
+            &sample_config(HdmiInput::Hdmi2),
+            NetworkTeardownDeps {
+                marker: &marker,
+                attempt_state: &attempt_state,
+                tv_client: &client,
+                sleeper: &sleeper,
+            },
+            RuntimeEvent::network_teardown_imminent(Some(true)),
+            None,
+        )
+        .expect("pending sleep teardown should wait and retry");
+
+        assert!(!sleeper.durations().is_empty());
+        assert_eq!(
+            outcome
+                .actions
+                .iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![ActionKind::TvSystemSleepPowerOff]
+        );
+        assert_eq!(
+            attempt_state
+                .read_outcome()
+                .expect("read completed outcome"),
+            Some(SystemSleepCycleOutcome::Completed)
+        );
+        assert!(marker.exists());
+        assert!(!attempt_state.exists());
+        assert_call_commands(&mock, &["get_input", "power_off"]);
+        assert!(rendered(&output).contains("retrying before network teardown"));
+    }
+
+    #[test]
     fn network_teardown_ordinary_disconnect_records_no_action_and_clears_attempt() {
         let temp_dir = TestDir::new("lifecycle-nm-not-sleeping");
         let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
@@ -2804,6 +2885,31 @@ mod tests {
     impl Sleeper for RecordingSleeper {
         fn sleep(&self, duration: Duration) {
             self.durations.borrow_mut().push(duration);
+        }
+    }
+
+    struct ReleasingSleeper {
+        durations: RefCell<Vec<Duration>>,
+        owner: RefCell<Option<SystemSleepAttemptLock>>,
+    }
+
+    impl ReleasingSleeper {
+        fn new(owner: SystemSleepAttemptLock) -> Self {
+            Self {
+                durations: RefCell::new(Vec::new()),
+                owner: RefCell::new(Some(owner)),
+            }
+        }
+
+        fn durations(&self) -> Vec<Duration> {
+            self.durations.borrow().clone()
+        }
+    }
+
+    impl Sleeper for ReleasingSleeper {
+        fn sleep(&self, duration: Duration) {
+            self.durations.borrow_mut().push(duration);
+            drop(self.owner.borrow_mut().take());
         }
     }
 
