@@ -9,10 +9,13 @@ use std::time::Duration;
 
 use crate::auth::resolve_bscpylgtv_auth_context_from_env;
 use crate::config::{load_config, resolve_config_path_from_env, Config};
+use crate::events::RuntimeEvent;
 use crate::lifecycle::ThreadSleeper;
 use crate::lifecycle::{self, JournalctlSleepDetector, NmOnlineNetworkWaiter};
 use crate::notifications::{FreedesktopNotifier, Notification, NotificationError, Notifier};
-use crate::state::{ScreenOwnershipMarker, StateScope, SystemSleepAttemptState};
+use crate::state::{
+    ScreenOwnershipMarker, StateScope, SystemSleepAttemptState, SystemSleepCycleState,
+};
 use crate::tv::{
     BscpylgtvCommandClient, OledBrightness, TvClient, TvDevice, UserScopedBscpylgtvCommandLauncher,
 };
@@ -242,14 +245,35 @@ pub fn run_screen_off<W: Write>(writer: &mut W) -> Result<(), RunError> {
 }
 
 pub fn run_sleep_pre<W: Write>(writer: &mut W) -> Result<(), RunError> {
+    run_sleep_pre_for_event(
+        writer,
+        RuntimeEvent::from_command(crate::Command::SleepPre)
+            .expect("sleep-pre should map to a runtime event"),
+    )
+}
+
+pub fn run_sleep_pre_for_event<W: Write>(
+    writer: &mut W,
+    event: RuntimeEvent,
+) -> Result<(), RunError> {
     let config_path = resolve_config_path_from_env().map_err(RunError::ConfigPath)?;
     let config = load_config(&config_path).map_err(RunError::Config)?;
     let marker = ScreenOwnershipMarker::from_env(StateScope::System).map_err(RunError::StateDir)?;
+    let cycle_state =
+        SystemSleepCycleState::from_env(StateScope::System).map_err(RunError::StateDir)?;
     let tv_client =
         build_tv_client(&config_path)?.with_command_timeout(SYSTEM_PRE_SLEEP_TV_COMMAND_TIMEOUT);
     let sleeper = ThreadSleeper;
 
-    lifecycle::attempt_system_sleep_power_off_with(writer, &config, &marker, &tv_client, &sleeper)
+    lifecycle::handle_system_suspend_with(
+        writer,
+        &config,
+        &marker,
+        &cycle_state,
+        &tv_client,
+        &sleeper,
+        event,
+    )
 }
 
 pub fn run_sleep<W: Write>(writer: &mut W) -> Result<(), RunError> {
@@ -360,12 +384,28 @@ pub fn run_system_resume<W: Write>(writer: &mut W) -> Result<(), RunError> {
         &network_waiter,
     );
 
+    let mut cleanup_error = None;
+
     if let Err(err) = attempt_state.clear() {
         writeln!(
             writer,
             "LG Buddy System Resume: could not clear system sleep attempt marker after resume. {err}"
         )?;
-        if result.is_ok() {
+        cleanup_error = Some(err);
+    }
+
+    if let Err(err) = attempt_state.clear_outcome() {
+        writeln!(
+            writer,
+            "LG Buddy System Resume: could not clear system sleep cycle state after resume. {err}"
+        )?;
+        if cleanup_error.is_none() {
+            cleanup_error = Some(err);
+        }
+    }
+
+    if result.is_ok() {
+        if let Some(err) = cleanup_error {
             return Err(RunError::Io(err));
         }
     }

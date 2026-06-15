@@ -80,7 +80,10 @@ mod tests {
         BusMethodCall, BusReply, BusSignal, BusSignalMatch, BusValue, SessionBusClient,
         SessionBusError,
     };
-    use crate::state::{ScreenOwnershipMarker, SystemSleepAttemptState};
+    use crate::state::{
+        ScreenOwnershipMarker, SystemSleepAttemptLock, SystemSleepAttemptState,
+        SystemSleepCycleOutcome,
+    };
     use crate::tv::BscpylgtvCommandClient;
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -155,6 +158,42 @@ mod tests {
     impl Sleeper for RecordingSleeper {
         fn sleep(&self, duration: Duration) {
             self.durations.borrow_mut().push(duration);
+        }
+    }
+
+    struct StateWritingSleeper {
+        durations: RefCell<Vec<Duration>>,
+        attempt_state: SystemSleepAttemptState,
+        outcome: SystemSleepCycleOutcome,
+        owner: RefCell<Option<SystemSleepAttemptLock>>,
+    }
+
+    impl StateWritingSleeper {
+        fn new(
+            attempt_state: SystemSleepAttemptState,
+            outcome: SystemSleepCycleOutcome,
+            owner: Option<SystemSleepAttemptLock>,
+        ) -> Self {
+            Self {
+                durations: RefCell::new(Vec::new()),
+                attempt_state,
+                outcome,
+                owner: RefCell::new(owner),
+            }
+        }
+
+        fn durations(&self) -> Vec<Duration> {
+            self.durations.borrow().clone()
+        }
+    }
+
+    impl Sleeper for StateWritingSleeper {
+        fn sleep(&self, duration: Duration) {
+            self.durations.borrow_mut().push(duration);
+            self.attempt_state
+                .write_outcome(self.outcome)
+                .expect("write terminal outcome during wait");
+            drop(self.owner.borrow_mut().take());
         }
     }
 
@@ -320,8 +359,133 @@ mod tests {
 
         assert!(marker.exists());
         assert!(!attempt_state.exists());
-        assert_call_commands(&mock, &["get_input", "power_off", "get_input", "power_off"]);
-        assert!(rendered(&output).contains("Could not query TV input"));
+        assert_call_commands(&mock, &["get_input", "power_off"]);
+        assert!(rendered(&output).contains("preparing for sleep"));
+    }
+
+    #[test]
+    fn pre_down_waits_when_logind_owned_cycle_is_in_progress() {
+        let temp_dir = TestDir::new("nm-pre-down-waits-in-progress");
+        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
+        let attempt_state = SystemSleepAttemptState::new(temp_dir.path().to_path_buf());
+        let _owner = attempt_state
+            .try_lock()
+            .expect("acquire logind owner lock")
+            .expect("logind owner lock should be available");
+        attempt_state
+            .write_outcome(SystemSleepCycleOutcome::InProgress)
+            .expect("write in-progress outcome");
+        let mock = MockBscpylgtv::new("nm-pre-down-waits-in-progress-tv");
+        mock.set_input("HDMI_2");
+        let client = client_for_mock(&mock);
+        let sleeper = StateWritingSleeper::new(
+            attempt_state.clone(),
+            SystemSleepCycleOutcome::Completed,
+            None,
+        );
+        let mut bus = FakeBus::preparing_for_sleep(true);
+        let mut output = Vec::new();
+
+        handle_pre_down_with(
+            &mut output,
+            &sample_config(SystemSleepWakePolicy::Enabled),
+            &marker,
+            &attempt_state,
+            &client,
+            &sleeper,
+            &mut bus,
+        )
+        .expect("pre-down should wait for in-progress rail");
+
+        assert!(!sleeper.durations().is_empty());
+        assert_eq!(
+            attempt_state.read_outcome().expect("read cycle outcome"),
+            Some(SystemSleepCycleOutcome::Completed)
+        );
+        assert_call_commands(&mock, &[]);
+        assert!(rendered(&output).contains("suspend rail completed"));
+    }
+
+    #[test]
+    fn pre_down_releases_teardown_when_in_progress_cycle_times_out() {
+        let temp_dir = TestDir::new("nm-pre-down-in-progress-timeout");
+        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
+        let attempt_state = SystemSleepAttemptState::new(temp_dir.path().to_path_buf());
+        let _owner = attempt_state
+            .try_lock()
+            .expect("acquire logind owner lock")
+            .expect("logind owner lock should be available");
+        attempt_state
+            .write_outcome(SystemSleepCycleOutcome::InProgress)
+            .expect("write in-progress outcome");
+        let mock = MockBscpylgtv::new("nm-pre-down-in-progress-timeout-tv");
+        let client = client_for_mock(&mock);
+        let sleeper = RecordingSleeper::default();
+        let mut bus = FakeBus::preparing_for_sleep(true);
+        let mut output = Vec::new();
+
+        handle_pre_down_with(
+            &mut output,
+            &sample_config(SystemSleepWakePolicy::Enabled),
+            &marker,
+            &attempt_state,
+            &client,
+            &sleeper,
+            &mut bus,
+        )
+        .expect("pre-down should release teardown after bounded wait");
+
+        assert!(!sleeper.durations().is_empty());
+        assert_eq!(
+            attempt_state.read_outcome().expect("read cycle outcome"),
+            Some(SystemSleepCycleOutcome::InProgress)
+        );
+        assert_call_commands(&mock, &[]);
+        assert!(rendered(&output).contains("did not finish before deadline"));
+    }
+
+    #[test]
+    fn pre_down_retries_when_waiting_cycle_reports_retryable_failure() {
+        let temp_dir = TestDir::new("nm-pre-down-in-progress-retryable");
+        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
+        let attempt_state = SystemSleepAttemptState::new(temp_dir.path().to_path_buf());
+        let owner = attempt_state
+            .try_lock()
+            .expect("acquire logind owner lock")
+            .expect("logind owner lock should be available");
+        attempt_state
+            .write_outcome(SystemSleepCycleOutcome::InProgress)
+            .expect("write in-progress outcome");
+        let mock = MockBscpylgtv::new("nm-pre-down-in-progress-retryable-tv");
+        mock.set_input("HDMI_2");
+        let client = client_for_mock(&mock);
+        let sleeper = StateWritingSleeper::new(
+            attempt_state.clone(),
+            SystemSleepCycleOutcome::RetryableTransportFailure,
+            Some(owner),
+        );
+        let mut bus = FakeBus::preparing_for_sleep(true);
+        let mut output = Vec::new();
+
+        handle_pre_down_with(
+            &mut output,
+            &sample_config(SystemSleepWakePolicy::Enabled),
+            &marker,
+            &attempt_state,
+            &client,
+            &sleeper,
+            &mut bus,
+        )
+        .expect("pre-down should retry retryable rail failure");
+
+        assert!(!sleeper.durations().is_empty());
+        assert_eq!(
+            attempt_state.read_outcome().expect("read cycle outcome"),
+            Some(SystemSleepCycleOutcome::Completed)
+        );
+        assert!(marker.exists());
+        assert_call_commands(&mock, &["get_input", "power_off"]);
+        assert!(rendered(&output).contains("retrying before network teardown"));
     }
 
     #[test]

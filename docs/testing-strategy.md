@@ -246,11 +246,16 @@ Secondary concern:
 
 These should not dominate the Rust test suite, but they still matter because installation and service wiring remain part of the real user path.
 
+The release-bundle smoke test covers the current installed lifecycle topology:
+the logind lifecycle service remains installed, the NetworkManager pre-down hook
+remains installed, and legacy systemd sleep hooks are absent.
+
 ## Current Practical Gaps
 
 The most important remaining gaps are:
 
-- host-level validation for installer and service wiring
+- real-host validation for installer and service wiring beyond the release-bundle
+  temporary-root smoke test
 - broader validation of the remaining shell setup surface
 - any future coverage needed for richer `swayidle` hooks beyond `timeout` and `resume`
 

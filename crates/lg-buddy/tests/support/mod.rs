@@ -9,6 +9,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::ErrorKind;
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command as ProcessCommand};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -765,7 +766,31 @@ fn spawn_mock_logind_service(
                     },
                 );
             });
-        crossroads.insert("/org/freedesktop/login1", &[properties_iface], ());
+        let manager_iface = crossroads.register("org.freedesktop.login1.Manager", move |builder| {
+            builder.method(
+                "Inhibit",
+                ("what", "who", "why", "mode"),
+                ("fd",),
+                move |_, _, (_what, _who, _why, _mode): (String, String, String, String)| {
+                    let mut pipe_fds = [0; 2];
+                    let pipe_result = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+                    if pipe_result != 0 {
+                        return Err(MethodErr::failed("mock logind could not create pipe"));
+                    }
+
+                    unsafe {
+                        libc::close(pipe_fds[1]);
+                    }
+                    let fd = unsafe { dbus::arg::OwnedFd::from_raw_fd(pipe_fds[0]) };
+                    Ok((fd,))
+                },
+            );
+        });
+        crossroads.insert(
+            "/org/freedesktop/login1",
+            &[properties_iface, manager_iface],
+            (),
+        );
 
         let shared_crossroads = Arc::new(Mutex::new(crossroads));
         let crossroads_receiver = Arc::clone(&shared_crossroads);

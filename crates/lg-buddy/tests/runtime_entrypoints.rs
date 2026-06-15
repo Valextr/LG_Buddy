@@ -290,7 +290,7 @@ fn settings_set_lifecycle_policy_updates_config_without_systemd_apply() {
 }
 
 #[test]
-fn run_system_resume_loads_config_and_clears_system_sleep_attempt() {
+fn run_system_resume_clears_sleep_cycle_state_and_preserves_session_marker() {
     let mock = MockBscpylgtv::new("entrypoint-system-resume-tv");
     let wrapper = mock.command_wrapper("entrypoint-system-resume-wrapper");
     let nm_online = MockNmOnline::new("entrypoint-system-resume-nm-online");
@@ -300,9 +300,12 @@ fn run_system_resume_loads_config_and_clears_system_sleep_attempt() {
     config.write_sample("HDMI_4");
 
     let runtime = RuntimeStateLayout::new("entrypoint-system-resume-runtime");
+    runtime.create_session_marker();
     runtime.create_system_marker();
     let attempt_marker = runtime.system_dir().join("system_sleep_attempted");
+    let cycle_state = runtime.system_dir().join("system_sleep_cycle");
     fs::write(&attempt_marker, "").expect("create attempt marker");
+    fs::write(&cycle_state, "outcome=completed\n").expect("create cycle state");
 
     let mut env = TestEnv::new();
     env.set("LG_BUDDY_CONFIG", config.path());
@@ -317,7 +320,9 @@ fn run_system_resume_loads_config_and_clears_system_sleep_attempt() {
     run_system_resume(&mut output).expect("system resume should succeed");
 
     runtime.assert_system_marker_absent();
+    runtime.assert_session_marker_exists();
     assert!(!attempt_marker.exists());
+    assert!(!cycle_state.exists());
     assert_eq!(
         mock.calls()
             .into_iter()
@@ -329,6 +334,50 @@ fn run_system_resume_loads_config_and_clears_system_sleep_attempt() {
     assert!(String::from_utf8(output)
         .expect("utf8 output")
         .contains("Wake from sleep: LG Buddy turned TV off. Restoring."));
+}
+
+#[test]
+fn run_system_resume_aggressive_policy_restores_without_system_marker() {
+    let mock = MockBscpylgtv::new("entrypoint-system-resume-aggressive-tv");
+    let wrapper = mock.command_wrapper("entrypoint-system-resume-aggressive-wrapper");
+    let nm_online = MockNmOnline::new("entrypoint-system-resume-aggressive-nm-online");
+    let nm_online_wrapper =
+        nm_online.command_wrapper("entrypoint-system-resume-aggressive-nm-online-wrapper");
+
+    let config = TestConfigFile::new("entrypoint-system-resume-aggressive-config");
+    config.write_sample("HDMI_4");
+    config.append_line("screen_restore_policy=aggressive");
+
+    let runtime = RuntimeStateLayout::new("entrypoint-system-resume-aggressive-runtime");
+    let cycle_state = runtime.system_dir().join("system_sleep_cycle");
+    fs::create_dir_all(runtime.system_dir()).expect("create system runtime dir");
+    fs::write(&cycle_state, "outcome=completed\n").expect("create cycle state");
+
+    let mut env = TestEnv::new();
+    env.set("LG_BUDDY_CONFIG", config.path());
+    env.set("LG_BUDDY_BSCPYLGTV_COMMAND", wrapper.path());
+    env.set("LG_BUDDY_SYSTEM_RUNTIME_DIR", runtime.system_dir());
+    env.set("LG_BUDDY_NM_ONLINE", nm_online_wrapper.path());
+    env.set("LG_BUDDY_STARTUP_INITIAL_WAKE_DELAY_SECS", "0");
+    env.set("LG_BUDDY_TV_ROUTE_WAIT_ATTEMPTS", "1");
+    env.set("LG_BUDDY_TV_ROUTE_WAIT_DELAY_MS", "0");
+
+    let mut output = Vec::new();
+    run_system_resume(&mut output).expect("aggressive system resume should succeed");
+
+    runtime.assert_system_marker_absent();
+    assert!(!cycle_state.exists());
+    assert_eq!(
+        mock.calls()
+            .into_iter()
+            .map(|call| call.command)
+            .collect::<Vec<_>>(),
+        vec!["set_input".to_string()]
+    );
+    assert_eq!(nm_online.invocations().len(), 1);
+    let output = String::from_utf8(output).expect("utf8 output");
+    assert!(output.contains("State file not found. Aggressive restore policy is enabled"));
+    assert!(output.contains("Wake from sleep: Restoring display state."));
 }
 
 #[test]
@@ -379,13 +428,13 @@ fn run_nm_pre_down_uses_logind_property_and_retries_idempotently() {
             .iter()
             .map(|call| call.command.as_str())
             .collect::<Vec<_>>(),
-        vec!["get_input", "power_off", "get_input", "power_off"]
+        vec!["get_input", "power_off"]
     );
     runtime.assert_system_marker_exists();
     runtime.assert_system_sleep_attempt_marker_absent();
     assert!(String::from_utf8(second_output)
         .expect("utf8 output")
-        .contains("Could not query TV input"));
+        .contains("logind is preparing for sleep"));
 }
 
 #[test]
@@ -582,6 +631,74 @@ fn run_lifecycle_monitor_uses_logind_resume_signal_and_runtime_restore() {
     assert!(output.contains("Session event `after-resume` requests wake restore"));
     assert!(output.contains("Wake from sleep: LG Buddy turned TV off. Restoring."));
     assert!(!output.contains("stopping lifecycle monitor"));
+}
+
+#[test]
+fn run_lifecycle_monitor_uses_logind_sleep_signal_for_pre_sleep_power_off() {
+    let mut env = TestEnv::new();
+    let logind = MockSystemLogind::new("entrypoint-lifecycle-logind-sleep");
+    logind.reset();
+    let mock = MockBscpylgtv::new("entrypoint-lifecycle-sleep-tv");
+    mock.set_input("HDMI_2");
+    let wrapper = mock.command_wrapper("entrypoint-lifecycle-sleep-wrapper");
+
+    let config = TestConfigFile::new("entrypoint-lifecycle-sleep-config");
+    config.write_sample("HDMI_2");
+
+    let runtime = RuntimeStateLayout::new("entrypoint-lifecycle-sleep-runtime");
+
+    env.set("DBUS_SYSTEM_BUS_ADDRESS", logind.address());
+    env.set("LG_BUDDY_CONFIG", config.path());
+    env.set("LG_BUDDY_BSCPYLGTV_COMMAND", wrapper.path());
+    env.set("LG_BUDDY_SYSTEM_RUNTIME_DIR", runtime.system_dir());
+    env.set("LG_BUDDY_LIFECYCLE_MONITOR_TEST_EVENT_LIMIT", "1");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let lifecycle_thread = thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = run_command(Command::Lifecycle, &mut output).map_err(|err| err.to_string());
+        done_tx
+            .send((result, output))
+            .expect("send lifecycle result");
+    });
+
+    wait_until(Duration::from_secs(4), || {
+        let calls = mock.calls();
+        let power_off_count = calls
+            .iter()
+            .filter(|call| call.command == "power_off")
+            .count();
+
+        if power_off_count == 0 {
+            logind.queue_prepare_for_sleep_signal(true);
+        }
+
+        power_off_count == 1 && runtime.system_marker_path().exists()
+    });
+
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .map(|call| call.command.as_str())
+            .collect::<Vec<_>>(),
+        vec!["get_input", "power_off"]
+    );
+    runtime.assert_system_marker_exists();
+
+    let (result, output) = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("lifecycle monitor should exit after test event limit");
+    lifecycle_thread
+        .join()
+        .expect("join lifecycle monitor thread");
+    result.expect("lifecycle monitor should succeed");
+
+    let output = String::from_utf8(output).expect("utf8 output");
+    assert!(output.contains("Using logind system lifecycle source"));
+    assert!(output.contains("System is preparing for sleep"));
+    assert!(output.contains("logind pre-sleep requests TV power-off"));
+    assert!(output.contains("Turning off for sleep"));
+    assert!(output.contains("Released logind sleep delay inhibitor"));
 }
 
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {

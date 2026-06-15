@@ -436,8 +436,9 @@ Flow:
 
 ### `lifecycle`
 
-`lifecycle` is the system sleep/wake resume event loop. Linux pre-sleep TV
-power-off is owned by the NetworkManager pre-down gate.
+`lifecycle` is the system sleep/wake event loop. Linux pre-sleep TV power-off is
+owned by one cooperative suspend rail that accepts both logind
+`PrepareForSleep(true)` and NetworkManager `pre-down` opportunities.
 
 Flow:
 
@@ -446,18 +447,20 @@ Flow:
 2. Open the system bus.
 3. Subscribe to logind `PrepareForSleep` signals.
 4. On `PrepareForSleep(true)`:
-   - log the diagnostic event
-   - do not run TV network I/O
+   - enter the central suspend rail under the logind delay inhibitor
+   - run one bounded pre-sleep TV decision unless another source already owns
+     or completed the cycle
 5. On `PrepareForSleep(false)`:
    - run wake restore policy from the canonical logind resume event
-   - clear stale legacy system sleep attempt state
+   - clear sleep-cycle coordination state
 6. If config is changed to disable lifecycle handling while the service is
    running, stop the lifecycle monitor cleanly.
 
 The NetworkManager pre-down gate runs `lg-buddy nm-pre-down`. That command reads
 logind `PreparingForSleep`; false or read failure returns quickly, true runs an
-idempotent pre-sleep power-off policy under a process lock before NetworkManager
-tears down the interface.
+idempotent pre-sleep rail before NetworkManager tears down the interface. If
+logind already owns the cycle, NetworkManager waits for a terminal rail outcome
+or bounded timeout before releasing teardown.
 
 ### `detect-backend`
 
@@ -544,10 +547,10 @@ There are two scopes:
 
 This is a direct replacement for the earlier ad hoc script coordination pattern.
 
-The NetworkManager pre-down path also uses a system-scope lock file to prevent
-concurrent pre-sleep handlers from racing each other. It does not use persisted
-attempt state to skip later hooks; repeated hooks are expected to be safe through
-idempotent TV policy.
+The cooperative suspend rail uses system-scope lock and cycle state files to
+prevent concurrent pre-sleep handlers from racing each other. Repeated hooks are
+expected to be safe through idempotent TV policy and persisted terminal cycle
+outcomes.
 
 ## Desktop Backend Strategy
 
@@ -682,8 +685,8 @@ The Rust runtime currently owns:
 - backend detection
 - startup
 - shutdown
-- system lifecycle handling through the NetworkManager pre-down gate plus
-  logind resume monitor
+- system lifecycle handling through the cooperative logind/NetworkManager
+  suspend rail plus logind resume monitor
 - screen-off
 - screen-on
 - brightness control
