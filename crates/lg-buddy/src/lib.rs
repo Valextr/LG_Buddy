@@ -1,4 +1,3 @@
-pub mod auth;
 pub mod backend;
 pub mod commands;
 pub mod config;
@@ -17,12 +16,12 @@ pub mod state;
 pub mod tv;
 pub mod updates;
 pub mod version;
+pub mod web_os;
 pub mod wol;
 
 pub use sources::desktop::{gnome, swayidle};
 pub use sources::linux::{logind, network_manager};
 
-use crate::auth::AuthContextError;
 use crate::backend::{
     configured_backend_from_env_or_config, detect_backend_from_system, BackendDetectionError,
     BackendSelectionError,
@@ -147,7 +146,6 @@ impl fmt::Display for ParseError {
 pub enum RunError {
     Io(io::Error),
     Policy(String),
-    AuthContext(AuthContextError),
     ConfigPath(ConfigPathError),
     Config(ConfigError),
     StateDir(StateDirError),
@@ -166,7 +164,6 @@ impl fmt::Display for RunError {
         match self {
             Self::Io(err) => write!(f, "{err}"),
             Self::Policy(err) => write!(f, "{err}"),
-            Self::AuthContext(err) => write!(f, "{err}"),
             Self::ConfigPath(err) => write!(f, "{err}"),
             Self::Config(err) => write!(f, "{err}"),
             Self::StateDir(err) => write!(f, "{err}"),
@@ -190,7 +187,6 @@ impl std::error::Error for RunError {
         match self {
             Self::Io(err) => Some(err),
             Self::Policy(_) => None,
-            Self::AuthContext(err) => Some(err),
             Self::ConfigPath(err) => Some(err),
             Self::Config(err) => Some(err),
             Self::StateDir(err) => Some(err),

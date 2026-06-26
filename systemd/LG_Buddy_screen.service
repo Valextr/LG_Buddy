@@ -4,7 +4,7 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=/usr/bin/lg-buddy monitor
+ExecStart=@LG_BUDDY_BIN@ monitor
 Restart=always
 RestartSec=10
 

@@ -9,13 +9,13 @@ INSTALL_ROOT="${INSTALL_ROOT%/}"
 SUDO_CMD="${LG_BUDDY_SUDO_CMD:-sudo}"
 NONINTERACTIVE="${LG_BUDDY_NONINTERACTIVE:-0}"
 SKIP_SYSTEMD_ACTIONS="${LG_BUDDY_SKIP_SYSTEMD_ACTIONS:-0}"
-SKIP_PIP_INSTALL="${LG_BUDDY_SKIP_PIP_INSTALL:-0}"
+DESKTOP_BRIGHTNESS_CONTROL=${LG_BUDDY_DESKTOP_BRIGHTNESS_CONTROL:-0}
 DEFAULT_RUNTIME_BINARY="$SCRIPT_DIR/lg-buddy"
 RUNTIME_BINARY="$DEFAULT_RUNTIME_BINARY"
 
 usage() {
     cat <<EOF
-Usage: $0 [--runtime-binary /path/to/lg-buddy]
+Usage: $0 [--runtime-binary /path/to/lg-buddy] [--desktop-brightness-control]
 
 Install LG Buddy from an existing runtime binary.
 
@@ -31,6 +31,10 @@ while [ "$#" -gt 0 ]; do
             RUNTIME_BINARY="${2:-}"
             [ -n "$RUNTIME_BINARY" ] || usage
             shift 2
+            ;;
+        --desktop-brightness-control)
+            DESKTOP_BRIGHTNESS_CONTROL=1
+            shift
             ;;
         -h|--help)
             usage
@@ -83,10 +87,36 @@ run_privileged() {
     fi
 }
 
-SYSTEM_BIN_DIR="$(prefix_path "/usr/bin")"
+detect_immutable_root() {
+    IMMUABLE_MODE=0
+    local test_file="/usr/bin/.lg-buddy-write-test"
+
+    if touch "$test_file" 2>/dev/null; then
+        rm -f "$test_file"
+    else
+        IMMUABLE_MODE=1
+    fi
+
+    if [ "$IMMUABLE_MODE" = "1" ]; then
+        echo "Detected immutable /usr (composefs/Atomic). Using alternate install paths."
+    else
+        echo "Writable /usr detected. Using standard install paths."
+    fi
+}
+
+detect_immutable_root
+
+if [ "$IMMUABLE_MODE" = "1" ]; then
+    SYSTEM_BIN_DIR="$(prefix_path "/opt/lg-buddy/bin")"
+else
+    SYSTEM_BIN_DIR="$(prefix_path "/usr/bin")"
+fi
 RUNTIME_INSTALL_PATH="${SYSTEM_BIN_DIR}/lg-buddy"
-VENV_DIR="${SYSTEM_BIN_DIR}/LG_Buddy_PIP"
-SYSTEM_LIB_DIR="$(prefix_path "/usr/lib/lg-buddy")"
+if [ "$IMMUABLE_MODE" = "1" ]; then
+    SYSTEM_LIB_DIR="$(prefix_path "/etc/lg-buddy")"
+else
+    SYSTEM_LIB_DIR="$(prefix_path "/usr/lib/lg-buddy")"
+fi
 CONFIG_POINTER_PATH="${SYSTEM_LIB_DIR}/config-path"
 COMMON_HELPER_PATH="${SYSTEM_LIB_DIR}/common.sh"
 SYSTEM_SLEEP_HOOK_PATH="$(prefix_path "/usr/lib/systemd/system-sleep/LG_Buddy_sleep_hook")"
@@ -104,7 +134,11 @@ TMPFILES_CONF_PATH="${TMPFILES_CONF_DIR}/lg_buddy.conf"
 NM_PRE_DOWN_DIR="$(prefix_path "/etc/NetworkManager/dispatcher.d/pre-down.d")"
 NM_SLEEP_HOOK_PATH="${NM_PRE_DOWN_DIR}/LG_Buddy_sleep"
 NM_LIFECYCLE_HOOK_PATH="${NM_PRE_DOWN_DIR}/LG_Buddy_lifecycle"
-APPLICATIONS_DIR="$(prefix_path "/usr/share/applications")"
+if [ "$IMMUABLE_MODE" = "1" ]; then
+    APPLICATIONS_DIR="$HOME/.local/share/applications"
+else
+    APPLICATIONS_DIR="$(prefix_path "/usr/share/applications")"
+fi
 DESKTOP_ENTRY_PATH="${APPLICATIONS_DIR}/LG_Buddy_Brightness.desktop"
 USER_SYSTEMD_DIR="${HOME}/.config/systemd/user"
 USER_SCREEN_SERVICE_PATH="${USER_SYSTEMD_DIR}/LG_Buddy_screen.service"
@@ -125,21 +159,6 @@ check_dep() {
     fi
 }
 
-check_python3_venv() {
-    local tmp_venv_dir=""
-    tmp_venv_dir="$(mktemp -d)" || return 1
-
-    if python3 -m venv "$tmp_venv_dir" >/dev/null 2>&1; then
-        rm -rf "$tmp_venv_dir"
-        return 0
-    fi
-
-    rm -rf "$tmp_venv_dir"
-    return 1
-}
-
-check_dep "python3-venv" "python3-venv" "check_python3_venv"
-check_dep "python3-pip" "python3-pip" "/usr/bin/python3 -m pip --version"
 check_dep "zenity" "zenity" "command -v zenity"
 
 write_config_override() {
@@ -174,8 +193,20 @@ if [ "\${2:-}" != "pre-down" ]; then
     exit 0
 fi
 
-exec /usr/bin/lg-buddy nm-pre-down
+exec ${RUNTIME_INSTALL_PATH} nm-pre-down
 EOF
+}
+
+cp_with_path() {
+    local src="$1"
+    local dst="$2"
+    local tmp=""
+
+    # Resolve file placeholders
+    tmp="$(mktemp)"
+    sed "s|@LG_BUDDY_BIN@|${RUNTIME_INSTALL_PATH}|g" "$src" >"$tmp"
+    run_privileged install -m 644 -- "$tmp" "$dst"
+    rm -f "$tmp"
 }
 
 cleanup_legacy_sleep_wake_handlers() {
@@ -352,26 +383,16 @@ else
     esac
 fi
 
-# 4. CREATE VIRTUAL ENVIRONMENT
-echo "Creating Python virtual environment at $VENV_DIR..."
-# Recreate the helper venv so OS Python minor-version upgrades do not leave
-# bscpylgtv installed under an interpreter-specific site-packages directory
-# that the new `/usr/bin/python3` no longer reads.
-run_privileged python3 -m venv --clear "$VENV_DIR"
-echo "Done."
-
-# 5. INSTALL BSCPYLGTV
-if [ "$SKIP_PIP_INSTALL" = "1" ]; then
-    echo "Skipping bscpylgtv installation because LG_BUDDY_SKIP_PIP_INSTALL=1."
-else
-    echo "Installing bscpylgtv into the virtual environment..."
-    run_privileged "$VENV_DIR/bin/pip" install bscpylgtv
-    echo "Done."
-fi
-
 # 6. INSTALL RUST RUNTIME AND SUPPORT FILES
 echo "Installing Rust runtime and support files..."
+run_privileged mkdir -p "$(dirname "$RUNTIME_INSTALL_PATH")"
 run_privileged install -m 755 "$RUNTIME_BINARY" "$RUNTIME_INSTALL_PATH"
+# On immutable systems, create a symlink in ~/.local/bin so lg-buddy is on PATH.
+if [ "$IMMUABLE_MODE" = "1" ]; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$RUNTIME_INSTALL_PATH" "$HOME/.local/bin/lg-buddy"
+    echo "Created symlink ~/.local/bin/lg-buddy → $RUNTIME_INSTALL_PATH"
+fi
 run_privileged rm -f "${SYSTEM_BIN_DIR}/LG_Buddy_Startup"
 run_privileged rm -f "${SYSTEM_BIN_DIR}/LG_Buddy_Shutdown"
 run_privileged rm -f "${SYSTEM_BIN_DIR}/LG_Buddy_Screen_On"
@@ -388,17 +409,19 @@ write_config_pointer "$CONFIG_POINTER_TMP" "$CONFIG_FILE"
 run_privileged install -m 644 "$CONFIG_POINTER_TMP" "$CONFIG_POINTER_PATH"
 rm -f "$CONFIG_POINTER_TMP"
 CONFIG_POINTER_TMP=""
-echo "Installing brightness control desktop entry..."
-run_privileged mkdir -p "$APPLICATIONS_DIR"
-run_privileged cp "$SCRIPT_DIR/LG_Buddy_Brightness.desktop" "$DESKTOP_ENTRY_PATH"
-cp "$SCRIPT_DIR/LG_Buddy_Brightness.desktop" ~/Desktop/ 2>/dev/null || true
-echo "Done."
+if [ "$DESKTOP_BRIGHTNESS_CONTROL" = "1" ]; then
+    echo "Installing brightness control desktop entry..."
+    run_privileged mkdir -p "$APPLICATIONS_DIR"
+    cp_with_path "$SCRIPT_DIR/LG_Buddy_Brightness.desktop" "$DESKTOP_ENTRY_PATH"
+    cp_with_path "$SCRIPT_DIR/LG_Buddy_Brightness.desktop" "$HOME/Desktop/" 2>/dev/null || true
+    echo "Done."
+fi
 
 # 7. SETUP SYSTEMD SERVICES
 echo "Copying and enabling systemd services..."
 run_privileged install -d "$SYSTEMD_SYSTEM_DIR"
 run_privileged install -d "$TMPFILES_CONF_DIR"
-run_privileged cp "$SCRIPT_DIR/systemd/LG_Buddy.service" "$SYSTEMD_SERVICE_PATH"
+cp_with_path "$SCRIPT_DIR/systemd/LG_Buddy.service" "$SYSTEMD_SERVICE_PATH"
 run_privileged cp "$SCRIPT_DIR/systemd/lg_buddy.conf" "$TMPFILES_CONF_PATH"
 run_privileged install -d "$SYSTEMD_SERVICE_OVERRIDE_DIR"
 SYSTEM_CONFIG_OVERRIDE_TMP="$(mktemp)"
@@ -409,7 +432,7 @@ SYSTEM_CONFIG_OVERRIDE_TMP=""
 
 cleanup_legacy_sleep_wake_handlers
 
-run_privileged cp "$SCRIPT_DIR/systemd/LG_Buddy_lifecycle.service" "$SYSTEMD_LIFECYCLE_SERVICE_PATH"
+cp_with_path "$SCRIPT_DIR/systemd/LG_Buddy_lifecycle.service" "$SYSTEMD_LIFECYCLE_SERVICE_PATH"
 run_privileged install -d "$SYSTEMD_LIFECYCLE_OVERRIDE_DIR"
 SYSTEM_CONFIG_OVERRIDE_TMP="$(mktemp)"
 write_config_override "$SYSTEM_CONFIG_OVERRIDE_TMP" "$CONFIG_FILE"
@@ -437,14 +460,14 @@ echo "Done."
 # 8. INSTALL USER SERVICES
 echo "Installing background update check user timer..."
 mkdir -p "$USER_SYSTEMD_DIR"
-cp "$SCRIPT_DIR/systemd/LG_Buddy_update_check.service" "$USER_UPDATE_CHECK_SERVICE_PATH"
-cp "$SCRIPT_DIR/systemd/LG_Buddy_update_check.timer" "$USER_UPDATE_CHECK_TIMER_PATH"
+cp_with_path "$SCRIPT_DIR/systemd/LG_Buddy_update_check.service" "$USER_UPDATE_CHECK_SERVICE_PATH"
+run_privileged cp "$SCRIPT_DIR/systemd/LG_Buddy_update_check.timer" "$USER_UPDATE_CHECK_TIMER_PATH"
 mkdir -p "$USER_UPDATE_CHECK_OVERRIDE_DIR"
 write_config_override "${USER_UPDATE_CHECK_OVERRIDE_DIR}/config.conf" "$CONFIG_FILE"
 echo "Done."
 
 echo "Installing screen monitor user service..."
-cp "$SCRIPT_DIR/systemd/LG_Buddy_screen.service" "$USER_SCREEN_SERVICE_PATH"
+cp_with_path "$SCRIPT_DIR/systemd/LG_Buddy_screen.service" "$USER_SCREEN_SERVICE_PATH"
 mkdir -p "$USER_SCREEN_OVERRIDE_DIR"
 write_config_override "${USER_SCREEN_OVERRIDE_DIR}/config.conf" "$CONFIG_FILE"
 if [ "$SKIP_SYSTEMD_ACTIONS" != "1" ]; then

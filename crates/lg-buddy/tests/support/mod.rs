@@ -1,3 +1,4 @@
+pub mod mock_webos;
 use dbus::arg::{PropMap, Variant as DbusVariant};
 use dbus::blocking::Connection as DbusConnection;
 use dbus::channel::{MatchingReceiver, Sender as DbusSender};

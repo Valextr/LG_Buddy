@@ -34,8 +34,6 @@ compiled as part of the build.
 
 Install prerequisites:
 
-- `python3-venv`
-- `python3-pip`
 - `zenity`
 
 Backend-specific:
@@ -61,21 +59,21 @@ Typical package installs:
 
 **Debian/Ubuntu/Pop!_OS**
 ```bash
-sudo apt install python3-venv python3-pip zenity
+sudo apt install zenity
 # Optional for non-GNOME Wayland sessions:
 sudo apt install swayidle
 ```
 
 **Fedora**
 ```bash
-sudo dnf install python3 python3-pip python3-virtualenv zenity
+sudo dnf install zenity
 # Optional for non-GNOME Wayland sessions:
 sudo dnf install swayidle
 ```
 
 **Arch**
 ```bash
-sudo pacman -S python python-pip python-virtualenv zenity
+sudo pacman -S zenity
 # Optional for non-GNOME Wayland sessions:
 sudo pacman -S swayidle
 ```
@@ -99,9 +97,7 @@ chmod +x ./install.sh
 
 The installer will prompt for your TV IP, MAC address, HDMI input, and session idle blanking details, then install the required services. System sleep/wake handling uses the lifecycle service plus NetworkManager pre-down gate as cooperating suspend sources unless you opt out in `config.env`.
 
-On first use, you may need to accept a pairing prompt on the TV:
-
-<https://github.com/chros73/bscpylgtv/blob/master/docs/guides/first_use.md>
+On first use, accept the pairing prompt that appears on your TV screen.
 
 ## Day to Day
 
@@ -200,6 +196,5 @@ checks through the same setting.
 
 ## Credits
 
-- <https://github.com/chros73> for `bscpylgtv`
 - <https://github.com/JPersson77> for the original inspiration
 - <https://github.com/Faceless3882> for the original shell script implementation

@@ -114,6 +114,7 @@ echo "Done."
 
 echo "Removing scripts"
 run_privileged rm -f "$RUNTIME_INSTALL_PATH"
+rm -f "$HOME/.local/bin/lg-buddy"
 run_privileged rm -f "${SYSTEM_BIN_DIR}/LG_Buddy_Startup"
 run_privileged rm -f "${SYSTEM_BIN_DIR}/LG_Buddy_Shutdown"
 run_privileged rm -f "${SYSTEM_BIN_DIR}/LG_Buddy_Screen_On"

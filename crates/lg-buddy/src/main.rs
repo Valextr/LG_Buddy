@@ -4,6 +4,11 @@ use std::process::ExitCode;
 use lg_buddy::{parse_args, run_command, usage, version, ParseOutcome};
 
 fn main() -> ExitCode {
+    // Install the ring-based crypto provider for rustls TLS connections.
+    // Required because tokio-tungstenite's rustls feature does not auto-install
+    // a global CryptoProvider when used alongside a direct rustls dependency.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let program = env::args().next().unwrap_or_else(|| "lg-buddy".to_string());
 
     match parse_args(env::args().skip(1)) {

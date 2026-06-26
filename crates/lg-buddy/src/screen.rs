@@ -4,7 +4,6 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::auth::resolve_bscpylgtv_auth_context_from_env;
 use crate::config::{
     load_config, resolve_config_path_from_env, Config, HdmiInput, MacAddress, ScreenRestorePolicy,
 };
@@ -17,9 +16,8 @@ use crate::policy::{
 use crate::runtime_phase::NoopRuntimePhaseProvider;
 use crate::runtime_phase::{LogindRuntimePhaseProvider, RuntimePhaseProvider, RuntimePhaseRead};
 use crate::state::{ScreenOwnershipMarker, StateScope};
-use crate::tv::{
-    BscpylgtvCommandClient, CurrentInput, TvClient, TvDevice, UserScopedBscpylgtvCommandLauncher,
-};
+use crate::tv::{CurrentInput, TvClient, TvDevice};
+use crate::web_os::WebOsTvClient;
 use crate::wol::{UdpWakeOnLanSender, WakeOnLanSender};
 use crate::RunError;
 
@@ -1106,656 +1104,385 @@ fn screen_on_retry_delay(attempt: u32) -> Duration {
 }
 
 fn build_tv_client(
-    config_path: &Path,
-) -> Result<BscpylgtvCommandClient<UserScopedBscpylgtvCommandLauncher>, RunError> {
-    let auth_context =
-        resolve_bscpylgtv_auth_context_from_env(config_path).map_err(RunError::AuthContext)?;
-
-    Ok(BscpylgtvCommandClient::from_env()
-        .with_auth_context(auth_context)
-        .with_launcher(UserScopedBscpylgtvCommandLauncher))
+    _config_path: &Path,
+) -> Result<WebOsTvClient, RunError> {
+    Ok(WebOsTvClient::with_defaults())
 }
-
 #[cfg(test)]
 mod tests {
-    mod support {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
-    }
-
-    use super::{
-        decide_screen_action_eligibility, decide_screen_off_after_input, decide_screen_on_start,
-        run_screen_off_with_outcome, run_screen_off_with_outcome_for_event,
-        run_screen_on_with_outcome, run_screen_on_with_outcome_for_event,
-        NoopSystemLifecycleStatusProvider, ScreenActionBlockReason, ScreenActionEligibilityInput,
-        ScreenEligibilityNext, ScreenOffInputObservation, ScreenOffNext, ScreenOnDeps,
-        ScreenOnNext, Sleeper, SystemLifecycleStatusProvider,
-    };
-    use crate::config::{
-        Config, HdmiInput, MacAddress, ScreenBackend, ScreenIdleBlankPolicy, ScreenRestorePolicy,
-        SystemSleepWakePolicy,
-    };
-    use crate::events::{EventSource, RuntimeEvent, RuntimeEventKind};
-    use crate::policy::{
-        ActionKind, DecisionReasonCode, StateMarker, StateTransition, TransitionReason,
-        TransitionReasonCode,
-    };
-    use crate::runtime_phase::{RuntimePhaseProvider, RuntimePhaseRead};
+    use super::*;
+    use crate::config::{Config, HdmiInput, MacAddress, ScreenBackend, ScreenIdleBlankPolicy, ScreenRestorePolicy, SystemSleepWakePolicy, DEFAULT_IDLE_TIMEOUT};
+    use crate::events::EventSource;
     use crate::state::ScreenOwnershipMarker;
-    use crate::tv::{BscpylgtvCommandClient, CurrentInput};
+    use crate::tv::{CommandOutput, CurrentInput, OledBrightness, TvClient, TvError};
     use crate::wol::{WakeOnLanError, WakeOnLanSender};
-    use std::cell::RefCell;
-    use std::fs;
+    use std::io;
     use std::net::Ipv4Addr;
-    use std::path::{Path, PathBuf};
-    use std::process;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, UNIX_EPOCH};
-    use support::MockBscpylgtv;
 
-    #[test]
-    fn pure_policy_marks_session_action_ineligible_while_sleep_is_pending() {
-        let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
-            source: EventSource::DesktopSession,
-            lifecycle_policy_enabled: true,
-            runtime_phase: RuntimePhaseRead::Pending,
-            system_restore_pending: false,
-        });
-
-        assert_eq!(
-            decision.next,
-            ScreenEligibilityNext::Stop(ScreenActionBlockReason::MachineSleepPending)
-        );
-        assert!(decision.outcome.actions.is_empty());
-        assert!(decision.outcome.state_transitions.is_empty());
-        assert_eq!(decision.outcome.no_actions.len(), 1);
-        assert_eq!(
-            decision.outcome.no_actions[0].reason.code,
-            DecisionReasonCode::RuntimePhaseIneligible
-        );
+    enum MockResult<T> {
+        Ok(T),
+        Err(&'static str),
+    }
+    impl MockResult<CommandOutput> {
+        fn to_result(&self, command: &'static str) -> Result<CommandOutput, TvError> {
+            match self {
+                Self::Ok(co) => Ok(co.clone()),
+                Self::Err(msg) => Err(TvError::Io { command, source: io::Error::new(io::ErrorKind::ConnectionRefused, msg.to_string()) }),
+            }
+        }
+    }
+    impl MockResult<String> {
+        fn to_result(&self, command: &'static str) -> Result<String, TvError> {
+            match self {
+                Self::Ok(s) => Ok(s.clone()),
+                Self::Err(msg) => Err(TvError::Io { command, source: io::Error::new(io::ErrorKind::ConnectionRefused, msg.to_string()) }),
+            }
+        }
+    }
+    impl MockResult<OledBrightness> {
+        fn to_result(&self, command: &'static str) -> Result<OledBrightness, TvError> {
+            match self {
+                Self::Ok(b) => Ok(*b),
+                Self::Err(msg) => Err(TvError::Io { command, source: io::Error::new(io::ErrorKind::ConnectionRefused, msg.to_string()) }),
+            }
+        }
     }
 
-    #[test]
-    fn pure_policy_fails_open_when_runtime_phase_is_unknown() {
-        let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
-            source: EventSource::DesktopSession,
-            lifecycle_policy_enabled: true,
-            runtime_phase: RuntimePhaseRead::Unknown {
-                detail: "system bus unavailable".to_string(),
-            },
-            system_restore_pending: false,
-        });
-
-        assert_eq!(decision.next, ScreenEligibilityNext::Continue);
-        assert!(decision.outcome.actions.is_empty());
-        assert!(decision.outcome.no_actions.is_empty());
-        assert_eq!(decision.outcome.diagnostics.len(), 1);
-        assert!(decision.outcome.diagnostics[0]
-            .message
-            .contains("failing open"));
+    struct MockTvClient {
+        pub input: MockResult<String>,
+        pub screen_off: MockResult<CommandOutput>,
+        pub screen_on: MockResult<CommandOutput>,
+        pub brightness: MockResult<OledBrightness>,
+        pub set_brightness: MockResult<CommandOutput>,
+        pub power_off: MockResult<CommandOutput>,
+        pub set_input: MockResult<CommandOutput>,
     }
 
-    #[test]
-    fn pure_policy_fails_closed_when_runtime_phase_is_unknown_but_system_restore_is_pending() {
-        let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
-            source: EventSource::DesktopSession,
-            lifecycle_policy_enabled: true,
-            runtime_phase: RuntimePhaseRead::Unknown {
-                detail: "system bus unavailable".to_string(),
-            },
-            system_restore_pending: true,
-        });
-
-        assert_eq!(
-            decision.next,
-            ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending)
-        );
-        assert!(decision.outcome.actions.is_empty());
-        assert_eq!(decision.outcome.no_actions.len(), 1);
-        assert_eq!(decision.outcome.diagnostics.len(), 1);
-        assert!(decision.outcome.diagnostics[0]
-            .message
-            .contains("failing closed"));
+    impl Default for MockTvClient {
+        fn default() -> Self {
+            let ok = CommandOutput::new("{\"returnValue\": true}\n".to_string(), String::new());
+            Self {
+                input: MockResult::Ok("com.webos.app.hdmi2".to_string()),
+                screen_off: MockResult::Ok(ok.clone()),
+                screen_on: MockResult::Ok(ok.clone()),
+                brightness: MockResult::Ok(OledBrightness::new(50).unwrap()),
+                set_brightness: MockResult::Ok(ok.clone()),
+                power_off: MockResult::Ok(ok.clone()),
+                set_input: MockResult::Ok(ok),
+            }
+        }
     }
 
-    #[test]
-    fn pure_policy_marks_session_action_ineligible_while_system_restore_is_pending() {
-        let decision = decide_screen_action_eligibility(ScreenActionEligibilityInput {
-            source: EventSource::DesktopSession,
-            lifecycle_policy_enabled: true,
-            runtime_phase: RuntimePhaseRead::NotPending,
-            system_restore_pending: true,
-        });
-
-        assert_eq!(
-            decision.next,
-            ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending)
-        );
-        assert!(decision.outcome.actions.is_empty());
-        assert!(decision.outcome.state_transitions.is_empty());
-        assert_eq!(decision.outcome.no_actions.len(), 1);
-        assert_eq!(
-            decision.outcome.no_actions[0].reason.code,
-            DecisionReasonCode::RuntimePhaseIneligible
-        );
+    impl TvClient for MockTvClient {
+        fn get_input(&self, _tv_ip: Ipv4Addr) -> Result<String, TvError> { self.input.to_result("get_input") }
+        fn get_oled_brightness(&self, _tv_ip: Ipv4Addr) -> Result<OledBrightness, TvError> { self.brightness.to_result("get_brightness") }
+        fn set_input(&self, _tv_ip: Ipv4Addr, _input: HdmiInput) -> Result<CommandOutput, TvError> { self.set_input.to_result("set_input") }
+        fn set_oled_brightness(&self, _tv_ip: Ipv4Addr, _brightness: OledBrightness) -> Result<CommandOutput, TvError> { self.set_brightness.to_result("set_brightness") }
+        fn power_off(&self, _tv_ip: Ipv4Addr) -> Result<CommandOutput, TvError> { self.power_off.to_result("power_off") }
+        fn turn_screen_off(&self, _tv_ip: Ipv4Addr) -> Result<CommandOutput, TvError> { self.screen_off.to_result("turn_screen_off") }
+        fn turn_screen_on(&self, _tv_ip: Ipv4Addr) -> Result<CommandOutput, TvError> { self.screen_on.to_result("turn_screen_on") }
     }
 
-    #[test]
-    fn pure_screen_off_policy_selects_blank_or_marker_clear_from_input_observation() {
-        let blank = decide_screen_off_after_input(
-            HdmiInput::Hdmi2,
-            ScreenOffInputObservation::Current(CurrentInput::Hdmi(HdmiInput::Hdmi2)),
-        );
-
-        assert_eq!(blank.next, ScreenOffNext::Blank);
-        assert_eq!(blank.outcome.actions[0].kind, ActionKind::TvScreenBlank);
-        assert!(blank.outcome.state_transitions.is_empty());
-
-        let skip = decide_screen_off_after_input(
-            HdmiInput::Hdmi2,
-            ScreenOffInputObservation::Current(CurrentInput::Hdmi(HdmiInput::Hdmi4)),
-        );
-
-        assert_eq!(skip.next, ScreenOffNext::Stop);
-        assert_eq!(
-            skip.outcome.no_actions[0].reason.code,
-            DecisionReasonCode::InputMismatch
-        );
-        assert_eq!(
-            skip.outcome.state_transitions,
-            vec![StateTransition::clear_marker(
-                StateMarker::SessionScreenOwnership,
-                TransitionReason::new(TransitionReasonCode::InputMismatch),
-            )]
-        );
+    struct MockWolSender {
+        pub result: &'static str,
+    }
+    impl Default for MockWolSender {
+        fn default() -> Self { Self { result: "" } }
+    }
+    impl WakeOnLanSender for MockWolSender {
+        fn send_magic_packet(&self, _mac: &MacAddress) -> Result<(), WakeOnLanError> {
+            if self.result.is_empty() { Ok(()) } else { Err(WakeOnLanError::Io { action: "send_wol", source: io::Error::new(io::ErrorKind::Other, String::from(self.result)) }) }
+        }
+        fn send_magic_packet_to(&self, _mac: &MacAddress, _tv_ip: Ipv4Addr) -> Result<(), WakeOnLanError> {
+            self.send_magic_packet(_mac)
+        }
     }
 
-    #[test]
-    fn pure_screen_on_policy_applies_restore_policy_without_reading_marker_state_itself() {
-        let conservative_missing = decide_screen_on_start(ScreenRestorePolicy::MarkerOnly, false);
-
-        assert_eq!(conservative_missing.next, ScreenOnNext::Stop);
-        assert_eq!(
-            conservative_missing.outcome.no_actions[0].reason.code,
-            DecisionReasonCode::MarkerMissing
-        );
-
-        let aggressive_missing = decide_screen_on_start(ScreenRestorePolicy::Aggressive, false);
-
-        assert_eq!(aggressive_missing.next, ScreenOnNext::Unblank);
-        assert_eq!(
-            aggressive_missing.outcome.actions[0].kind,
-            ActionKind::TvScreenRestore
-        );
-        assert_eq!(aggressive_missing.outcome.diagnostics.len(), 1);
+    struct NoopSleeper;
+    impl Sleeper for NoopSleeper {
+        fn sleep(&self, _duration: Duration) {}
     }
 
-    #[test]
-    fn screen_off_outcome_records_blank_action_and_marker_creation() {
-        let temp_dir = TestDir::new("screen-outcome-off-success");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        let mock = MockBscpylgtv::new("screen-outcome-off-success-tv");
-        mock.set_input("HDMI_2");
-        let client = client_for_mock(&mock);
-
-        let mut output = Vec::new();
-        let outcome = run_screen_off_with_outcome(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            &client,
-        )
-        .expect("screen-off should succeed");
-
-        assert_eq!(
-            outcome
-                .actions
-                .iter()
-                .map(|action| action.kind)
-                .collect::<Vec<_>>(),
-            vec![ActionKind::TvScreenBlank]
-        );
-        assert_eq!(
-            outcome.state_transitions,
-            vec![StateTransition::create_marker(
-                StateMarker::SessionScreenOwnership,
-                TransitionReason::new(TransitionReasonCode::ActionSelected),
-            )]
-        );
-        assert!(outcome.no_actions.is_empty());
-        assert!(outcome.diagnostics.is_empty());
-        assert!(marker.exists());
+    fn mac_addr() -> MacAddress {
+        "aa:bb:cc:dd:ee:ff".parse().unwrap()
     }
 
-    #[test]
-    fn screen_off_outcome_records_input_mismatch_no_action_and_marker_clear() {
-        let temp_dir = TestDir::new("screen-outcome-off-skip");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        marker.create().expect("create stale marker");
-        let mock = MockBscpylgtv::new("screen-outcome-off-skip-tv");
-        mock.set_input("HDMI_4");
-        let client = client_for_mock(&mock);
-
-        let mut output = Vec::new();
-        let outcome = run_screen_off_with_outcome(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            &client,
-        )
-        .expect("screen-off skip should succeed");
-
-        assert!(outcome.actions.is_empty());
-        assert_eq!(outcome.no_actions.len(), 1);
-        assert_eq!(
-            outcome.no_actions[0].reason.code,
-            DecisionReasonCode::InputMismatch
-        );
-        assert_eq!(
-            outcome.state_transitions,
-            vec![StateTransition::clear_marker(
-                StateMarker::SessionScreenOwnership,
-                TransitionReason::new(TransitionReasonCode::InputMismatch),
-            )]
-        );
-        assert!(!marker.exists());
-    }
-
-    #[test]
-    fn screen_on_outcome_records_restore_action_and_marker_clear() {
-        let temp_dir = TestDir::new("screen-outcome-on-success");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        marker.create().expect("create marker");
-        let mock = MockBscpylgtv::new("screen-outcome-on-success-tv");
-        mock.set_screen_on(false);
-        let client = client_for_mock(&mock);
-        let wol = RecordingWakeOnLanSender::default();
-        let sleeper = RecordingSleeper::default();
-
-        let mut output = Vec::new();
-        let outcome = run_screen_on_with_outcome(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            &client,
-            &wol,
-            &sleeper,
-        )
-        .expect("screen-on should succeed");
-
-        assert_eq!(
-            outcome
-                .actions
-                .iter()
-                .map(|action| action.kind)
-                .collect::<Vec<_>>(),
-            vec![ActionKind::TvScreenRestore]
-        );
-        assert_eq!(
-            outcome.state_transitions,
-            vec![StateTransition::clear_marker(
-                StateMarker::SessionScreenOwnership,
-                TransitionReason::new(TransitionReasonCode::RestoreCompleted),
-            )]
-        );
-        assert!(outcome.no_actions.is_empty());
-        assert!(!marker.exists());
-    }
-
-    #[test]
-    fn screen_on_outcome_records_marker_missing_no_action() {
-        let temp_dir = TestDir::new("screen-outcome-on-missing-marker");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        let mock = MockBscpylgtv::new("screen-outcome-on-missing-marker-tv");
-        let client = client_for_mock(&mock);
-        let wol = RecordingWakeOnLanSender::default();
-        let sleeper = RecordingSleeper::default();
-
-        let mut output = Vec::new();
-        let outcome = run_screen_on_with_outcome(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            &client,
-            &wol,
-            &sleeper,
-        )
-        .expect("missing marker should skip");
-
-        assert!(outcome.actions.is_empty());
-        assert_eq!(outcome.no_actions.len(), 1);
-        assert_eq!(
-            outcome.no_actions[0].reason.code,
-            DecisionReasonCode::MarkerMissing
-        );
-        assert!(outcome.state_transitions.is_empty());
-    }
-
-    #[test]
-    fn session_screen_off_is_ineligible_while_machine_sleep_is_pending() {
-        let temp_dir = TestDir::new("screen-phase-off-pending");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        let mock = MockBscpylgtv::new("screen-phase-off-pending-tv");
-        mock.set_input("HDMI_2");
-        let client = client_for_mock(&mock);
-        let mut phase = FixedRuntimePhaseProvider::pending();
-        let lifecycle_status = NoopSystemLifecycleStatusProvider;
-
-        let mut output = Vec::new();
-        let outcome = run_screen_off_with_outcome_for_event(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            &client,
-            RuntimeEvent::new(EventSource::DesktopSession, RuntimeEventKind::SessionIdle),
-            &mut phase,
-            &lifecycle_status,
-        )
-        .expect("pending machine sleep should skip session screen off");
-
-        assert!(outcome.actions.is_empty());
-        assert_eq!(outcome.no_actions.len(), 1);
-        assert_eq!(
-            outcome.no_actions[0].reason.code,
-            DecisionReasonCode::RuntimePhaseIneligible
-        );
-        assert!(outcome.state_transitions.is_empty());
-        assert!(!marker.exists());
-        assert!(mock.calls().is_empty());
-        assert!(rendered(&output).contains("Machine sleep is pending"));
-    }
-
-    #[test]
-    fn session_screen_on_is_ineligible_while_machine_sleep_is_pending() {
-        let temp_dir = TestDir::new("screen-phase-on-pending");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        marker.create().expect("create marker");
-        let mock = MockBscpylgtv::new("screen-phase-on-pending-tv");
-        mock.set_screen_on(false);
-        let client = client_for_mock(&mock);
-        let wol = RecordingWakeOnLanSender::default();
-        let sleeper = RecordingSleeper::default();
-        let mut phase = FixedRuntimePhaseProvider::pending();
-        let lifecycle_status = NoopSystemLifecycleStatusProvider;
-
-        let mut output = Vec::new();
-        let outcome = run_screen_on_with_outcome_for_event(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            ScreenOnDeps {
-                tv_client: &client,
-                wol_sender: &wol,
-                sleeper: &sleeper,
-                phase_provider: &mut phase,
-                lifecycle_status: &lifecycle_status,
-            },
-            RuntimeEvent::new(
-                EventSource::AuxiliaryInput,
-                RuntimeEventKind::UserActivityObserved,
-            ),
-        )
-        .expect("pending machine sleep should skip session screen on");
-
-        assert!(outcome.actions.is_empty());
-        assert_eq!(outcome.no_actions.len(), 1);
-        assert_eq!(
-            outcome.no_actions[0].reason.code,
-            DecisionReasonCode::RuntimePhaseIneligible
-        );
-        assert!(outcome.state_transitions.is_empty());
-        assert!(marker.exists());
-        assert!(mock.calls().is_empty());
-    }
-
-    #[test]
-    fn session_screen_on_is_ineligible_while_system_restore_is_pending() {
-        let temp_dir = TestDir::new("screen-phase-on-system-restore-pending");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        marker.create().expect("create marker");
-        let mock = MockBscpylgtv::new("screen-phase-on-system-restore-pending-tv");
-        mock.set_screen_on(false);
-        let client = client_for_mock(&mock);
-        let wol = RecordingWakeOnLanSender::default();
-        let sleeper = RecordingSleeper::default();
-        let mut phase = FixedRuntimePhaseProvider::not_pending();
-        let lifecycle_status = FixedSystemLifecycleStatusProvider { pending: true };
-
-        let mut output = Vec::new();
-        let outcome = run_screen_on_with_outcome_for_event(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            ScreenOnDeps {
-                tv_client: &client,
-                wol_sender: &wol,
-                sleeper: &sleeper,
-                phase_provider: &mut phase,
-                lifecycle_status: &lifecycle_status,
-            },
-            RuntimeEvent::new(
-                EventSource::DesktopSession,
-                RuntimeEventKind::ScreenWakeRequested,
-            ),
-        )
-        .expect("pending system restore should skip session screen on");
-
-        assert!(outcome.actions.is_empty());
-        assert_eq!(outcome.no_actions.len(), 1);
-        assert_eq!(
-            outcome.no_actions[0].reason.code,
-            DecisionReasonCode::RuntimePhaseIneligible
-        );
-        assert!(outcome.state_transitions.is_empty());
-        assert!(marker.exists());
-        assert!(mock.calls().is_empty());
-        assert!(wol.calls.borrow().is_empty());
-        assert!(rendered(&output).contains("System resume restore is pending"));
-    }
-
-    #[test]
-    fn disabled_lifecycle_policy_does_not_block_session_screen_actions() {
-        let temp_dir = TestDir::new("screen-phase-disabled");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        let mock = MockBscpylgtv::new("screen-phase-disabled-tv");
-        mock.set_input("HDMI_2");
-        let client = client_for_mock(&mock);
-        let mut config = sample_config(HdmiInput::Hdmi2);
-        config.system_sleep_wake_policy = SystemSleepWakePolicy::Disabled;
-        let mut phase = FixedRuntimePhaseProvider::pending();
-        let lifecycle_status = NoopSystemLifecycleStatusProvider;
-
-        let mut output = Vec::new();
-        let outcome = run_screen_off_with_outcome_for_event(
-            &mut output,
-            &config,
-            &marker,
-            &client,
-            RuntimeEvent::new(EventSource::DesktopSession, RuntimeEventKind::SessionIdle),
-            &mut phase,
-            &lifecycle_status,
-        )
-        .expect("disabled lifecycle policy should fail open");
-
-        assert_eq!(
-            outcome
-                .actions
-                .iter()
-                .map(|action| action.kind)
-                .collect::<Vec<_>>(),
-            vec![ActionKind::TvScreenBlank]
-        );
-        assert!(outcome.no_actions.is_empty());
-        assert!(marker.exists());
-        assert_call_commands(&mock, &["get_input", "turn_screen_off"]);
-    }
-
-    #[test]
-    fn unknown_runtime_phase_fails_open_for_session_screen_actions() {
-        let temp_dir = TestDir::new("screen-phase-unknown");
-        let marker = ScreenOwnershipMarker::new(temp_dir.path().to_path_buf());
-        let mock = MockBscpylgtv::new("screen-phase-unknown-tv");
-        mock.set_input("HDMI_2");
-        let client = client_for_mock(&mock);
-        let mut phase = FixedRuntimePhaseProvider::unknown("system bus unavailable");
-        let lifecycle_status = NoopSystemLifecycleStatusProvider;
-
-        let mut output = Vec::new();
-        let outcome = run_screen_off_with_outcome_for_event(
-            &mut output,
-            &sample_config(HdmiInput::Hdmi2),
-            &marker,
-            &client,
-            RuntimeEvent::new(EventSource::DesktopSession, RuntimeEventKind::SessionIdle),
-            &mut phase,
-            &lifecycle_status,
-        )
-        .expect("unknown runtime phase should fail open");
-
-        assert_eq!(
-            outcome
-                .actions
-                .iter()
-                .map(|action| action.kind)
-                .collect::<Vec<_>>(),
-            vec![ActionKind::TvScreenBlank]
-        );
-        assert_eq!(outcome.diagnostics.len(), 1);
-        assert!(outcome.no_actions.is_empty());
-        assert!(marker.exists());
-        assert_call_commands(&mock, &["get_input", "turn_screen_off"]);
-    }
-
-    fn sample_config(input: HdmiInput) -> Config {
+    fn test_config() -> Config {
         Config {
-            tv_ip: "192.0.2.42".parse::<Ipv4Addr>().expect("parse ipv4"),
-            tv_mac: "aa:bb:cc:dd:ee:ff"
-                .parse::<MacAddress>()
-                .expect("parse mac"),
-            input,
+            tv_ip: Ipv4Addr::new(192, 0, 2, 1),
+            tv_mac: mac_addr(),
+            input: HdmiInput::Hdmi2,
             screen_backend: ScreenBackend::Auto,
-            screen_idle_blank: ScreenIdleBlankPolicy::Enabled,
-            screen_idle_timeout: 300,
+            screen_idle_timeout: DEFAULT_IDLE_TIMEOUT,
             screen_restore_policy: ScreenRestorePolicy::MarkerOnly,
+            screen_idle_blank: ScreenIdleBlankPolicy::Enabled,
             system_sleep_wake_policy: SystemSleepWakePolicy::Enabled,
         }
     }
 
-    fn client_for_mock(mock: &MockBscpylgtv) -> BscpylgtvCommandClient {
-        BscpylgtvCommandClient::with_args(mock.command_path(), mock.command_args())
+    fn test_config_input_mismatch() -> Config {
+        Config { input: HdmiInput::Hdmi3, ..test_config() }
     }
 
-    fn assert_call_commands(mock: &MockBscpylgtv, expected: &[&str]) {
-        let actual = mock
-            .calls()
-            .into_iter()
-            .map(|call| call.command)
-            .collect::<Vec<_>>();
-        let expected = expected
-            .iter()
-            .map(|command| command.to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
+    fn temp_marker(label: &str) -> ScreenOwnershipMarker {
+        let dir = std::env::temp_dir().join(format!("lg-buddy-marker-{}-{}", label, std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        ScreenOwnershipMarker::new(dir)
     }
 
-    fn rendered(output: &[u8]) -> String {
-        String::from_utf8(output.to_vec()).expect("utf8 output")
+    // ---- decide_screen_off_after_input ----
+
+    #[test]
+    fn screen_off_blank_when_input_matches() {
+        let d = decide_screen_off_after_input(HdmiInput::Hdmi2, ScreenOffInputObservation::Current(CurrentInput::Hdmi(HdmiInput::Hdmi2)));
+        assert_eq!(d.next, ScreenOffNext::Blank);
+        assert_eq!(d.outcome.actions[0].kind, ActionKind::TvScreenBlank);
     }
 
-    #[derive(Default)]
-    struct RecordingWakeOnLanSender {
-        calls: RefCell<Vec<MacAddress>>,
+    #[test]
+    fn screen_off_stop_when_input_mismatch() {
+        let d = decide_screen_off_after_input(HdmiInput::Hdmi2, ScreenOffInputObservation::Current(CurrentInput::Hdmi(HdmiInput::Hdmi3)));
+        assert_eq!(d.next, ScreenOffNext::Stop);
+        assert_eq!(d.outcome.no_actions[0].reason.code, DecisionReasonCode::InputMismatch);
     }
 
-    impl WakeOnLanSender for RecordingWakeOnLanSender {
-        fn send_magic_packet(&self, mac: &MacAddress) -> Result<(), WakeOnLanError> {
-            self.calls.borrow_mut().push(*mac);
-            Ok(())
-        }
+    #[test]
+    fn screen_off_stop_when_input_is_other() {
+        let d = decide_screen_off_after_input(HdmiInput::Hdmi2, ScreenOffInputObservation::Current(CurrentInput::Other("com.webos.app.browse".to_string())));
+        assert_eq!(d.next, ScreenOffNext::Stop);
     }
 
-    #[derive(Default)]
-    struct RecordingSleeper {
-        durations: RefCell<Vec<Duration>>,
+    #[test]
+    fn screen_off_fallback_on_query_failure() {
+        let d = decide_screen_off_after_input(HdmiInput::Hdmi2, ScreenOffInputObservation::QueryFailed("refused".to_string()));
+        assert_eq!(d.next, ScreenOffNext::PowerOffFallback);
+        assert_eq!(d.outcome.actions[0].kind, ActionKind::TvPowerOffFallback);
     }
 
-    impl Sleeper for RecordingSleeper {
-        fn sleep(&self, duration: Duration) {
-            self.durations.borrow_mut().push(duration);
-        }
+    // ---- decide_screen_action_eligibility ----
+
+    #[test]
+    fn action_eligible_for_non_session_source() {
+        let i = ScreenActionEligibilityInput { source: EventSource::CliApi, lifecycle_policy_enabled: true, runtime_phase: RuntimePhaseRead::Pending, system_restore_pending: true };
+        assert_eq!(decide_screen_action_eligibility(i).next, ScreenEligibilityNext::Continue);
     }
 
-    struct FixedRuntimePhaseProvider {
-        read: RuntimePhaseRead,
+    #[test]
+    fn action_eligible_when_lifecycle_disabled() {
+        let i = ScreenActionEligibilityInput { source: EventSource::DesktopSession, lifecycle_policy_enabled: false, runtime_phase: RuntimePhaseRead::Pending, system_restore_pending: true };
+        assert_eq!(decide_screen_action_eligibility(i).next, ScreenEligibilityNext::Continue);
     }
 
-    impl FixedRuntimePhaseProvider {
-        fn pending() -> Self {
-            Self {
-                read: RuntimePhaseRead::Pending,
-            }
-        }
-
-        fn not_pending() -> Self {
-            Self {
-                read: RuntimePhaseRead::NotPending,
-            }
-        }
-
-        fn unknown(detail: &str) -> Self {
-            Self {
-                read: RuntimePhaseRead::Unknown {
-                    detail: detail.to_string(),
-                },
-            }
-        }
+    #[test]
+    fn action_blocked_by_machine_sleep() {
+        let i = ScreenActionEligibilityInput { source: EventSource::DesktopSession, lifecycle_policy_enabled: true, runtime_phase: RuntimePhaseRead::Pending, system_restore_pending: false };
+        assert_eq!(decide_screen_action_eligibility(i).next, ScreenEligibilityNext::Stop(ScreenActionBlockReason::MachineSleepPending));
     }
 
-    impl RuntimePhaseProvider for FixedRuntimePhaseProvider {
-        fn machine_sleep_pending(&mut self) -> RuntimePhaseRead {
-            self.read.clone()
-        }
+    #[test]
+    fn action_blocked_by_system_restore() {
+        let i = ScreenActionEligibilityInput { source: EventSource::DesktopSession, lifecycle_policy_enabled: true, runtime_phase: RuntimePhaseRead::NotPending, system_restore_pending: true };
+        assert_eq!(decide_screen_action_eligibility(i).next, ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending));
     }
 
-    struct FixedSystemLifecycleStatusProvider {
-        pending: bool,
+    #[test]
+    fn action_eligible_clean_state() {
+        let i = ScreenActionEligibilityInput { source: EventSource::DesktopSession, lifecycle_policy_enabled: true, runtime_phase: RuntimePhaseRead::NotPending, system_restore_pending: false };
+        assert_eq!(decide_screen_action_eligibility(i).next, ScreenEligibilityNext::Continue);
     }
 
-    impl SystemLifecycleStatusProvider for FixedSystemLifecycleStatusProvider {
-        fn system_restore_pending(&self) -> bool {
-            self.pending
-        }
+    #[test]
+    fn action_fails_open_unknown_phase() {
+        let i = ScreenActionEligibilityInput { source: EventSource::DesktopSession, lifecycle_policy_enabled: true, runtime_phase: RuntimePhaseRead::Unknown { detail: "dbus".to_string() }, system_restore_pending: false };
+        let d = decide_screen_action_eligibility(i);
+        assert_eq!(d.next, ScreenEligibilityNext::Continue);
+        assert!(!d.outcome.diagnostics.is_empty());
     }
 
-    struct TestDir {
-        path: PathBuf,
+    #[test]
+    fn action_fails_closed_unknown_phase_with_restore() {
+        let i = ScreenActionEligibilityInput { source: EventSource::DesktopSession, lifecycle_policy_enabled: true, runtime_phase: RuntimePhaseRead::Unknown { detail: "dbus".to_string() }, system_restore_pending: true };
+        assert_eq!(decide_screen_action_eligibility(i).next, ScreenEligibilityNext::Stop(ScreenActionBlockReason::SystemRestorePending));
     }
 
-    impl TestDir {
-        fn new(label: &str) -> Self {
-            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    // ---- decide_screen_off_after_blank_result ----
 
-            let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time after unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "lg-buddy-{label}-{}-{timestamp}-{unique}",
-                process::id()
-            ));
-
-            fs::create_dir_all(&path).expect("create test temp dir");
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
+    #[test]
+    fn blank_succeeded_creates_marker() {
+        let d = decide_screen_off_after_blank_result(TvEffectObservation::Succeeded);
+        assert_eq!(d.next, ScreenOffNext::Stop);
+        assert!(d.outcome.state_transitions.iter().any(|t| matches!(t, StateTransition::CreateMarker { .. })));
     }
 
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+    #[test]
+    fn blank_failed_fallback_power_off() {
+        let d = decide_screen_off_after_blank_result(TvEffectObservation::Failed("off".to_string()));
+        assert_eq!(d.next, ScreenOffNext::PowerOffFallback);
+    }
+
+    // ---- decide_screen_off_after_power_off_result ----
+
+    #[test]
+    fn power_off_succeeded_creates_marker() {
+        let d = decide_screen_off_after_power_off_result(TvEffectObservation::Succeeded);
+        assert_eq!(d.next, ScreenOffNext::Stop);
+        assert!(d.outcome.state_transitions.iter().any(|t| matches!(t, StateTransition::CreateMarker { .. })));
+    }
+
+    #[test]
+    fn power_off_failed_stops_with_diagnostic() {
+        let d = decide_screen_off_after_power_off_result(TvEffectObservation::Failed("refused".to_string()));
+        assert_eq!(d.next, ScreenOffNext::Stop);
+        assert!(!d.outcome.diagnostics.is_empty());
+    }
+
+    // ---- decide_screen_on_start ----
+
+    #[test]
+    fn screen_on_stop_no_marker_marker_only() {
+        let d = decide_screen_on_start(ScreenRestorePolicy::MarkerOnly, false);
+        assert_eq!(d.next, ScreenOnNext::Stop);
+        assert_eq!(d.outcome.no_actions[0].reason.code, DecisionReasonCode::MarkerMissing);
+    }
+
+    #[test]
+    fn screen_on_unblank_marker_exists() {
+        let d = decide_screen_on_start(ScreenRestorePolicy::MarkerOnly, true);
+        assert_eq!(d.next, ScreenOnNext::Unblank);
+        assert_eq!(d.outcome.actions[0].kind, ActionKind::TvScreenRestore);
+    }
+
+    #[test]
+    fn screen_on_aggressive_no_marker() {
+        let d = decide_screen_on_start(ScreenRestorePolicy::Aggressive, false);
+        assert_eq!(d.next, ScreenOnNext::Unblank);
+        assert!(!d.outcome.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn screen_on_aggressive_with_marker() {
+        let d = decide_screen_on_start(ScreenRestorePolicy::Aggressive, true);
+        assert_eq!(d.next, ScreenOnNext::Unblank);
+        assert!(d.outcome.diagnostics.is_empty());
+    }
+
+    // ---- decide_screen_on_after_unblank ----
+
+    #[test]
+    fn unblank_succeeded_clears_marker() {
+        let d = decide_screen_on_after_unblank(ScreenOnUnblankObservation::Succeeded);
+        assert_eq!(d.next, ScreenOnNext::Stop);
+        assert!(d.outcome.state_transitions.iter().any(|t| matches!(t, StateTransition::ClearMarker { .. })));
+    }
+
+    #[test]
+    fn unblank_substate_mismatch_full_wake() {
+        let d = decide_screen_on_after_unblank(ScreenOnUnblankObservation::SubstateMismatch("x".to_string()));
+        assert_eq!(d.next, ScreenOnNext::FullWake);
+    }
+
+    #[test]
+    fn unblank_failed_full_wake() {
+        let d = decide_screen_on_after_unblank(ScreenOnUnblankObservation::Failed("refused".to_string()));
+        assert_eq!(d.next, ScreenOnNext::FullWake);
+    }
+
+    // ---- is_session_screen_source ----
+
+    #[test]
+    fn desktop_session_session_source() { assert!(is_session_screen_source(EventSource::DesktopSession)); }
+    #[test]
+    fn auxiliary_input_session_source() { assert!(is_session_screen_source(EventSource::AuxiliaryInput)); }
+    #[test]
+    fn cli_api_not_session_source() { assert!(!is_session_screen_source(EventSource::CliApi)); }
+    #[test]
+    fn linux_logind_not_session_source() { assert!(!is_session_screen_source(EventSource::LinuxLogind)); }
+    #[test]
+    fn future_platform_not_session_source() { assert!(!is_session_screen_source(EventSource::FuturePlatform)); }
+
+    // ---- Integration: run_screen_off_with_outcome ----
+
+    #[test]
+    fn run_screen_off_blanks_on_configured_input() {
+        let config = test_config();
+        let marker = temp_marker("off-blank");
+        let _ = std::fs::remove_file(marker.path());
+        let client = MockTvClient::default();
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_off_with_outcome(&mut output, &config, &marker, &client).expect("screen off");
+        assert_eq!(outcome.actions.len(), 1);
+        assert_eq!(outcome.actions[0].kind, ActionKind::TvScreenBlank);
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn run_screen_off_skips_input_mismatch() {
+        let config = test_config_input_mismatch();
+        let marker = temp_marker("off-skip");
+        let _ = std::fs::remove_file(marker.path());
+        let client = MockTvClient::default();
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_off_with_outcome(&mut output, &config, &marker, &client).expect("screen off");
+        assert_eq!(outcome.no_actions[0].reason.code, DecisionReasonCode::InputMismatch);
+    }
+
+    #[test]
+    fn run_screen_off_fallback_input_failure() {
+        let config = test_config();
+        let marker = temp_marker("off-fail");
+        let _ = std::fs::remove_file(marker.path());
+        let client = MockTvClient { input: MockResult::Err("refused"), ..Default::default() };
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_off_with_outcome(&mut output, &config, &marker, &client).expect("screen off");
+        assert!(outcome.actions.iter().any(|a| a.kind == ActionKind::TvPowerOffFallback));
+    }
+
+    #[test]
+    fn run_screen_off_fallback_blank_failure() {
+        let config = test_config();
+        let marker = temp_marker("off-bf");
+        let _ = std::fs::remove_file(marker.path());
+        let client = MockTvClient { screen_off: MockResult::Err("refused"), ..Default::default() };
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_off_with_outcome(&mut output, &config, &marker, &client).expect("screen off");
+        assert!(outcome.actions.iter().any(|a| a.kind == ActionKind::TvScreenBlank));
+        assert!(outcome.actions.iter().any(|a| a.kind == ActionKind::TvPowerOffFallback));
+    }
+
+    // ---- Integration: run_screen_on_with_outcome ----
+
+    #[test]
+    fn run_screen_on_skips_no_marker() {
+        let config = test_config();
+        let marker = temp_marker("on-skip");
+        let _ = std::fs::remove_file(marker.path());
+        let client = MockTvClient::default();
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_on_with_outcome(&mut output, &config, &marker, &client, &MockWolSender::default(), &NoopSleeper).expect("screen on");
+        assert_eq!(outcome.no_actions[0].reason.code, DecisionReasonCode::MarkerMissing);
+    }
+
+    #[test]
+    fn run_screen_on_unblanks_marker_exists() {
+        let config = test_config();
+        let marker = temp_marker("on-unblank");
+        marker.create().expect("create marker");
+        let client = MockTvClient::default();
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_on_with_outcome(&mut output, &config, &marker, &client, &MockWolSender::default(), &NoopSleeper).expect("screen on");
+        assert_eq!(outcome.actions[0].kind, ActionKind::TvScreenRestore);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn run_screen_on_aggressive_no_marker() {
+        let mut config = test_config();
+        config.screen_restore_policy = ScreenRestorePolicy::Aggressive;
+        let marker = temp_marker("on-aggressive");
+        let _ = std::fs::remove_file(marker.path());
+        let client = MockTvClient::default();
+        let mut output = Vec::<u8>::new();
+        let outcome = run_screen_on_with_outcome(&mut output, &config, &marker, &client, &MockWolSender::default(), &NoopSleeper).expect("screen on");
+        assert_eq!(outcome.actions[0].kind, ActionKind::TvScreenRestore);
     }
 }

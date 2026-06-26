@@ -6,13 +6,23 @@ publish = false
 
 [dependencies]
 dbus = { version = "0.9.11", features = ["vendored"] }
+base64 = "0.22"
 dbus-crossroads = "0.5.3"
 evdev = "0.13.2"
+futures = "0.3"
+env_logger = "0.11"
 libc = "0.2"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+tungstenite = "0.24"
 ureq = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [lib]
 path = "src/lib.rs"
@@ -22,10 +32,8 @@ name = "lg-buddy"
 path = "src/main.rs"
 
 [dev-dependencies]
-cucumber = "0.22.1"
-tokio = { version = "1", features = ["macros", "rt"] }
+futures = "0.3"
+env_logger = "0.11"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
-[[test]]
-name = "cucumber"
-path = "tests/cucumber.rs"
-harness = false

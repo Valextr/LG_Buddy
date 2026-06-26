@@ -5,4 +5,4 @@ PartOf=graphical-session.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/lg-buddy updates background-check
+ExecStart=@LG_BUDDY_BIN@ updates background-check

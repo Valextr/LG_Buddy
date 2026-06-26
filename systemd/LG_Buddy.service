@@ -8,8 +8,8 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 RemainAfterExit=true
-ExecStart=/usr/bin/lg-buddy startup boot
-ExecStop=/usr/bin/lg-buddy shutdown
+ExecStart=@LG_BUDDY_BIN@ startup boot
+ExecStop=@LG_BUDDY_BIN@ shutdown
 
 [Install]
 Alias=LG_Buddy.service

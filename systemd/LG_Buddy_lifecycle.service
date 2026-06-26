@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/lg-buddy lifecycle
+ExecStart=@LG_BUDDY_BIN@ lifecycle
 Restart=on-failure
 RestartSec=10
 
